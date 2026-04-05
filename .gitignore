@@ -1,0 +1,19 @@
+# C++ build output (Conan + CMake)
+build/
+core/build/
+core/CMakeUserPresets.json
+
+# Old xmake cache
+core/.xmake/
+
+# Java build output (Maven)
+coordinator/target/
+
+# IDE & tooling
+.idea/
+*.iml
+.vscode/
+**/.cache/
+
+# OS
+.DS_Store

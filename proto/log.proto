@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package engine.log.v1;
+
+option cc_generic_services = false;
+
+// ─── Propose ──────────────────────────────────────────────────────────────────
+// Java submits an opaque log entry; C++ Leader replicates it via Raft.
+
+message ProposeReq {
+  bytes data = 1;   // opaque payload (Java decides the encoding)
+}
+
+message ProposeResp {
+  uint64 index = 1;  // log index assigned by Raft
+  uint64 term  = 2;
+}
+
+// ─── SubscribeCommitted ───────────────────────────────────────────────────────
+// Java subscribes to committed log entries for state machine replay.
+
+message SubscribeReq {
+  uint64 start_index = 1;  // replay from this index (inclusive); 0 = latest only
+}
+
+message CommittedEntry {
+  uint64 index = 1;
+  uint64 term  = 2;
+  bytes  data  = 3;  // same opaque bytes that were Proposed
+}
+
+// ─── Snapshot ─────────────────────────────────────────────────────────────────
+// Java owns the snapshot data (KV + Lease state).
+// SaveSnapshot: Java → C++ (upload), C++ truncates Raft log.
+// LoadSnapshot: C++ → Java (download), for crash recovery / slow followers.
+
+message SnapshotChunk {
+  uint64 last_index = 1;  // snapshot covers entries up to this index
+  uint64 last_term  = 2;
+  bytes  data       = 3;  // chunk payload
+  bool   done       = 4;  // true on the final chunk
+}
+
+message SaveSnapshotResp {
+  bool ok = 1;
+}
+
+message LoadSnapshotReq {}
+
+// ─── Status ───────────────────────────────────────────────────────────────────
+
+message StatusReq {}
+
+message StatusResp {
+  bool   is_leader = 1;
+  uint64 term      = 2;
+  uint64 leader_id = 3;
+}
+
+// ─── Service ──────────────────────────────────────────────────────────────────
+// C++ implements this; Java calls it.
+// C++ knows nothing about KV / Watch / Lease — it only replicates bytes.
+
+service RaftLog {
+  rpc Propose            (ProposeReq)           returns (ProposeResp);
+  rpc SubscribeCommitted (SubscribeReq)         returns (stream CommittedEntry);
+  rpc SaveSnapshot       (stream SnapshotChunk) returns (SaveSnapshotResp);
+  rpc LoadSnapshot       (LoadSnapshotReq)      returns (stream SnapshotChunk);
+  rpc Status             (StatusReq)            returns (StatusResp);
+}
