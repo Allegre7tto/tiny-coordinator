@@ -20,6 +20,10 @@ void RaftLogServiceImpl::OnCommitted(unsigned long long index, unsigned long lon
         data.size());
 
     std::lock_guard lock(mu_);
+    // If queue is full, drop oldest entries to prevent memory exhaustion
+    while (committed_queue_.size() >= kMaxCommittedQueueSize) {
+        committed_queue_.pop_front();
+    }
     committed_queue_.push_back(std::move(entry));
     committed_cv_.notify_all();
 }
@@ -107,20 +111,34 @@ grpc::Status RaftLogServiceImpl::LoadSnapshot(
         grpc::ServerContext*,
         const ::engine::log::v1::LoadSnapshotReq*,
         grpc::ServerWriter<::engine::log::v1::SnapshotChunk>* writer) {
-    // Load snapshot from C++ storage via RaftNode
-    // For now, snapshot is loaded via the Raft restore path and sent as a single chunk
-    // TODO: implement chunked transfer for large snapshots
-
     spdlog::info("RaftLog: Java requested snapshot load");
 
-    // The snapshot data is available through the Raft apply callback (ApplySnapshot).
-    // Java should receive it via SubscribeCommitted when a follower is behind.
-    // This RPC is reserved for explicit snapshot load on cold start.
+    std::vector<std::byte> data;
+    unsigned long long last_index = 0, last_term = 0;
+    if (!node_->LoadSnapshot(data, last_index, last_term)) {
+        ::engine::log::v1::SnapshotChunk empty_chunk;
+        empty_chunk.set_done(true);
+        writer->Write(empty_chunk);
+        return grpc::Status::OK;
+    }
 
-    ::engine::log::v1::SnapshotChunk chunk;
-    chunk.set_done(true);
-    writer->Write(chunk);
+    const size_t chunk_size = 64 * 1024; // 64KB chunks
+    size_t offset = 0;
+    while (offset < data.size()) {
+        size_t end = std::min(offset + chunk_size, data.size());
+        ::engine::log::v1::SnapshotChunk chunk;
+        chunk.set_last_index(last_index);
+        chunk.set_last_term(last_term);
+        chunk.set_data(
+            reinterpret_cast<const char*>(data.data() + offset),
+            end - offset);
+        chunk.set_done(end >= data.size());
+        if (!writer->Write(chunk)) break;
+        offset = end;
+    }
 
+    spdlog::info("RaftLog: snapshot load complete at index={} term={} size={}",
+                 last_index, last_term, data.size());
     return grpc::Status::OK;
 }
 

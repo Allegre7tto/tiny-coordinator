@@ -1,14 +1,13 @@
 #pragma once
 
+#include "grpcpp/completion_queue.h"
 #include "raft/raft.h"
 #include "raft/config.h"
 
 #include "raft.grpc.pb.h"
 
-#include <atomic>
 #include <memory>
 #include <mutex>
-#include <string>
 #include <thread>
 #include <vector>
 
@@ -38,6 +37,9 @@ public:
     void TakeSnapshot(unsigned long long index, const std::vector<std::byte>& snapshot);
     bool CondInstallSnapshot(unsigned long long last_term, unsigned long long last_index,
                              const std::vector<std::byte>& snapshot);
+    bool LoadSnapshot(std::vector<std::byte>& out_data,
+                      unsigned long long& out_last_index,
+                      unsigned long long& out_last_term);
 
     // ── gRPC service (RaftInternal) ───────────────────────────────────────────
     grpc::Status RequestVote(grpc::ServerContext*,
@@ -53,6 +55,59 @@ public:
                                  ::engine::raft::v1::InstallSnapshotResp*) override;
 
 private:
+    // ── Async RPC tag types ────────────────────────────────────────────────
+    struct RpcTag {
+        grpc::ClientContext ctx;
+        grpc::Status        status;
+        virtual ~RpcTag() = default;
+        virtual void OnComplete(RaftNode* node) = 0;
+    };
+
+    struct VoteTag final : RpcTag {
+        ::engine::raft::v1::RequestVoteResp resp;
+        std::unique_ptr<grpc::ClientAsyncResponseReader<
+            ::engine::raft::v1::RequestVoteResp>> reader;
+        unsigned long long election_term;
+        unsigned int peer;
+
+        void OnComplete(RaftNode* node) override {
+            if (!status.ok()) return;
+            std::lock_guard lock(node->mutex_);
+            node->raft_->OnVoteReply(election_term, peer, resp);
+        }
+    };
+
+    struct AppendTag final : RpcTag {
+        ::engine::raft::v1::AppendEntriesResp resp;
+        std::unique_ptr<grpc::ClientAsyncResponseReader<
+            ::engine::raft::v1::AppendEntriesResp>> reader;
+        unsigned long long sent_term;
+        unsigned long long prev_index;
+        unsigned int       sent_num;
+        unsigned int       peer;
+
+        void OnComplete(RaftNode* node) override {
+            if (!status.ok()) return;
+            std::lock_guard lock(node->mutex_);
+            node->raft_->OnAppendReply(sent_term, peer, prev_index, sent_num, resp);
+        }
+    };
+
+    struct SnapshotTag final : RpcTag {
+        ::engine::raft::v1::InstallSnapshotResp resp;
+        std::unique_ptr<grpc::ClientAsyncResponseReader<
+            ::engine::raft::v1::InstallSnapshotResp>> reader;
+        unsigned long long sent_term;
+        unsigned long long last_index;
+        unsigned int       peer;
+
+        void OnComplete(RaftNode* node) override {
+            if (!status.ok()) return;
+            std::lock_guard lock(node->mutex_);
+            node->raft_->OnSnapshotReply(sent_term, peer, last_index, resp);
+        }
+    };
+
     void DispatchTask(const RaftTask& task);
 
     mutable std::mutex    mutex_;
@@ -60,8 +115,10 @@ private:
 
     std::vector<std::unique_ptr<::engine::raft::v1::RaftInternal::Stub>> stubs_;
 
-    std::jthread      ticker_;
-    std::atomic<bool> stopped_{false};
+    std::jthread          ticker_;
+    grpc::CompletionQueue cq_;
+    std::jthread          io_thread_;
+    Storage*              storage_ptr_ = nullptr; // owned by Raft
 };
 
 } // namespace engine::raft

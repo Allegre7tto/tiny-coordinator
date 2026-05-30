@@ -25,6 +25,7 @@ using TimePoint = Clock::time_point;
 struct ApplyCommand {
     std::vector<std::byte> data;
     unsigned long long     index = 0;
+    unsigned long long     term  = 0;
 };
 
 struct ApplySnapshot {

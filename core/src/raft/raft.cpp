@@ -221,7 +221,7 @@ void Raft::ApplyReady() {
         std::vector<std::byte> data(
             reinterpret_cast<const std::byte*>(e.data().data()),
             reinterpret_cast<const std::byte*>(e.data().data() + e.data().size()));
-        on_commit_(ApplyCommand{std::move(data), applied_});
+        on_commit_(ApplyCommand{std::move(data), applied_, e.term()});
     }
 }
 

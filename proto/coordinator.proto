@@ -135,6 +135,70 @@ message LeaseKeepAliveResponse {
   int64          ttl    = 3;
 }
 
+// ─── Txn ─────────────────────────────────────────────────────────────────────
+
+message Compare {
+  enum CompareTarget {
+    KEY            = 0;
+    VALUE          = 1;
+    CREATE_REVISION = 2;
+    MOD_REVISION   = 3;
+    VERSION        = 4;
+  }
+
+  enum CompareResult {
+    EQUAL  = 0;
+    GREATER = 1;
+    LESS   = 2;
+  }
+
+  CompareTarget target  = 1;
+  CompareResult result  = 2;
+  bytes          key     = 3;
+  bytes          value   = 4;
+}
+
+message RequestOp {
+  oneof request {
+    PutRequest    put    = 1;
+    DeleteRequest delete = 2;
+    GetRequest    range  = 3;
+  }
+}
+
+message OperationResponse {
+  oneof response {
+    PutResponse    put    = 1;
+    DeleteResponse delete = 2;
+    GetResponse    range  = 3;
+  }
+  int64 revision = 4;
+}
+
+message TxnRequest {
+  repeated Compare    compare = 1;
+  repeated RequestOp  success = 2;
+  repeated RequestOp  failure = 3;
+}
+
+message TxnResponse {
+  ResponseHeader              header    = 1;
+  bool                        succeeded = 2;
+  repeated OperationResponse  responses = 3;
+}
+
+// ─── Compact ────────────────────────────────────────────────────────────────
+
+message CompactRequest {
+  int64 revision = 1;
+}
+
+message CompactResponse {
+  ResponseHeader header        = 1;
+  int64          revision      = 2;
+  int64          removed_count = 3;
+}
+
 // ─── Cluster ─────────────────────────────────────────────────────────────────
 message Member {
   uint64          id         = 1;
@@ -155,6 +219,12 @@ service Coordinator {
   rpc Put    (PutRequest)    returns (PutResponse);
   rpc Get    (GetRequest)    returns (GetResponse);
   rpc Delete (DeleteRequest) returns (DeleteResponse);
+
+  // Txn
+  rpc Txn (TxnRequest) returns (TxnResponse);
+
+  // Compact
+  rpc Compact (CompactRequest) returns (CompactResponse);
 
   // Watch (bidirectional streaming)
   rpc Watch (stream WatchRequest) returns (stream WatchResponse);

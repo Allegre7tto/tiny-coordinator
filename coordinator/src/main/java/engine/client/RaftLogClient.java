@@ -32,10 +32,17 @@ public class RaftLogClient {
 
     // ── Propose ───────────────────────────────────────────────────────────────
 
-    public ProposeResp propose(byte[] data) {
-        return blockingStub.propose(ProposeReq.newBuilder()
+    public CompletableFuture<ProposeResp> propose(byte[] data) {
+        CompletableFuture<ProposeResp> future = new CompletableFuture<>();
+        asyncStub.propose(ProposeReq.newBuilder()
                 .setData(ByteString.copyFrom(data))
-                .build());
+                .build(),
+                new StreamObserver<>() {
+                    @Override public void onNext(ProposeResp resp) { future.complete(resp); }
+                    @Override public void onError(Throwable t)     { future.completeExceptionally(t); }
+                    @Override public void onCompleted()            { if (!future.isDone()) future.completeExceptionally(new RuntimeException("Stream completed without response")); }
+                });
+        return future;
     }
 
     // ── Subscribe to committed entries (reactive stream) ──────────────────────

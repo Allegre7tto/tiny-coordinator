@@ -7,6 +7,8 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import engine.client.RaftLogClient;
+
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Map;
@@ -30,6 +32,7 @@ public class LeaseManager {
     private static final Logger LOG = Logger.getLogger(LeaseManager.class);
 
     @Inject StateMachineDriver driver;
+    @Inject RaftLogClient raftClient;
 
     private record Lease(
         long       id,
@@ -97,6 +100,14 @@ public class LeaseManager {
 
     @Scheduled(every = "1s")
     void checkExpiry() {
+        // Only leader should propose lease revocations
+        try {
+            if (!raftClient.status().getIsLeader()) return;
+        } catch (Exception e) {
+            LOG.debug("Failed to check leader status: " + e.getMessage());
+            return;
+        }
+
         Instant now = Instant.now();
         leases.forEach((id, lease) -> {
             if (now.isAfter(lease.deadline())) {

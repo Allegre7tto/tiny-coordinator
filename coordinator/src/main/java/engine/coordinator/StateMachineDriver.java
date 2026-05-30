@@ -4,10 +4,14 @@ import engine.client.RaftLogClient;
 import engine.coordinator.v1.CoordinatorOuterClass.*;
 import engine.log.v1.Log.CommittedEntry;
 import engine.log.v1.Log.SnapshotChunk;
+import engine.mvcc.CompactManager;
+import engine.mvcc.TxnManager;
 
 import com.google.protobuf.ByteString;
 import com.google.protobuf.InvalidProtocolBufferException;
+import io.smallrye.mutiny.infrastructure.Infrastructure;
 import io.smallrye.mutiny.subscription.Cancellable;
+import io.vertx.mutiny.core.Vertx;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -37,12 +41,16 @@ public class StateMachineDriver {
     public static final byte OP_DELETE       = 0x02;
     public static final byte OP_LEASE_GRANT  = 0x03;
     public static final byte OP_LEASE_REVOKE = 0x04;
+    public static final byte OP_TXN          = 0x05;
+    public static final byte OP_COMPACT      = 0x06;
 
     private static final long SNAPSHOT_INTERVAL = 10_000; // entries between snapshots
 
-    @Inject RaftLogClient raftClient;
-    @Inject KvStore       kvStore;
-    @Inject LeaseManager  leaseManager;
+    @Inject RaftLogClient   raftClient;
+    @Inject KvStore         kvStore;
+    @Inject LeaseManager    leaseManager;
+    @Inject TxnManager      txnManager;
+    @Inject CompactManager  compactManager;
 
     private final AtomicLong lastApplied = new AtomicLong(0);
     private long lastSnapshotIndex = 0;
@@ -74,12 +82,7 @@ public class StateMachineDriver {
         // Phase 2: Subscribe to committed entries
         long startIdx = lastApplied.get() + 1;
         LOG.infof("Subscribing to committed entries from index=%d", startIdx);
-
-        subscription = raftClient.subscribeCommitted(startIdx)
-                .subscribe().with(
-                    this::applyEntry,
-                    err -> LOG.errorf(err, "Committed stream error; will attempt reconnect")
-                );
+        subscribeCommitted(startIdx);
     }
 
     @PreDestroy
@@ -99,18 +102,16 @@ public class StateMachineDriver {
         data[0] = opType;
         System.arraycopy(payload, 0, data, 1, payload.length);
 
-        try {
-            var resp = raftClient.propose(data);
-            CompletableFuture<Long> future = new CompletableFuture<>();
-            pendingProposals.put(resp.getIndex(), future);
+        return raftClient.propose(data)
+                .thenCompose(resp -> {
+                    CompletableFuture<Long> future = new CompletableFuture<>();
+                    pendingProposals.put(resp.getIndex(), future);
 
-            // Timeout to prevent indefinite blocking
-            future.orTimeout(10, TimeUnit.SECONDS)
-                  .whenComplete((rev, ex) -> pendingProposals.remove(resp.getIndex()));
-            return future;
-        } catch (Exception e) {
-            return CompletableFuture.failedFuture(e);
-        }
+                    // Timeout to prevent indefinite blocking
+                    future.orTimeout(10, TimeUnit.SECONDS)
+                          .whenComplete((rev, ex) -> pendingProposals.remove(resp.getIndex()));
+                    return future;
+                });
     }
 
     // ── Apply (single-threaded, called from committed stream) ─────────────────
@@ -147,6 +148,12 @@ public class StateMachineDriver {
                     LeaseRevokeRequest req = LeaseRevokeRequest.parseFrom(payload);
                     leaseManager.applyRevoke(req.getId());
                 }
+                case OP_TXN -> {
+                    LOG.debugf("Txn applied at index=%d", index);
+                }
+                case OP_COMPACT -> {
+                    LOG.debugf("Compact applied at index=%d", index);
+                }
                 default -> LOG.warnf("Unknown op type: 0x%02x at index %d", opType, index);
             }
         } catch (InvalidProtocolBufferException e) {
@@ -179,4 +186,27 @@ public class StateMachineDriver {
     }
 
     public long lastAppliedIndex() { return lastApplied.get(); }
+
+    private void subscribeCommitted(long startIdx) {
+        subscription = raftClient.subscribeCommitted(startIdx)
+                .onFailure().retry().withBackOff(java.time.Duration.ofSeconds(1), java.time.Duration.ofSeconds(10)).atMost(3)
+                .emitOn(Infrastructure.getDefaultExecutor())
+                .subscribe().with(
+                    this::applyEntry,
+                    err -> {
+                        LOG.errorf(err, "Committed stream error; will attempt reconnect");
+                        scheduleReconnect();
+                    }
+                );
+    }
+
+    private void scheduleReconnect() {
+        long delay = 1000; // 1 second initial delay
+        Vertx vertx = Vertx.vertx();
+        vertx.setTimer(delay, id -> {
+            long newStartIdx = lastApplied.get() + 1;
+            LOG.infof("Reconnecting to committed stream from index=%d", newStartIdx);
+            subscribeCommitted(newStartIdx);
+        });
+    }
 }

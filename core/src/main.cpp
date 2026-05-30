@@ -13,11 +13,15 @@
 
 static engine::server::GrpcServer*        g_server   = nullptr;
 static engine::server::RaftLogServiceImpl* g_raft_log = nullptr;
+static engine::raft::RaftNode*             g_raft_node = nullptr;
 
 static void OnSignal(int) {
     spdlog::info("shutting down...");
+    // Shutdown gRPC server first to stop accepting new RPCs
+    if (g_server) g_server->Shutdown();
+    // Shutdown RaftLogService to unblock committed stream writers
     if (g_raft_log) g_raft_log->Shutdown();
-    if (g_server)   g_server->Shutdown();
+    // RaftNode will be destructed when main returns (stack unwinding)
 }
 
 //   engine <node_id> <data_dir> <peer0_addr> [<peer1_addr> ...]
@@ -64,7 +68,7 @@ int main(int argc, char* argv[]) {
         std::visit([raft_log_ptr](const auto& m) {
             using T = std::decay_t<decltype(m)>;
             if constexpr (std::is_same_v<T, engine::raft::ApplyCommand>) {
-                raft_log_ptr->OnCommitted(m.index, 0, m.data);
+                raft_log_ptr->OnCommitted(m.index, m.term, m.data);
             }
         }, msg);
     };
@@ -78,8 +82,9 @@ int main(int argc, char* argv[]) {
     // ── gRPC server ───────────────────────────────────────────────────────────
     engine::server::GrpcServer grpc_server(
         listen_addr, raft_node.get(), raft_log_svc.get());
-    g_server   = &grpc_server;
-    g_raft_log = raft_log_svc.get();
+    g_server    = &grpc_server;
+    g_raft_log  = raft_log_svc.get();
+    g_raft_node = raft_node.get();
 
     std::signal(SIGINT,  OnSignal);
     std::signal(SIGTERM, OnSignal);

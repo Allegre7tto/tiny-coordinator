@@ -2,6 +2,8 @@ package engine.coordinator;
 
 import engine.coordinator.v1.CoordinatorGrpc;
 import engine.coordinator.v1.CoordinatorOuterClass.*;
+import engine.mvcc.CompactManager;
+import engine.mvcc.TxnManager;
 
 import com.google.protobuf.ByteString;
 import io.grpc.stub.StreamObserver;
@@ -16,12 +18,6 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * Implements coordinator.proto for external clients.
- *
- * Architecture (v3):
- *   - Writes → StateMachineDriver.propose() → C++ Raft → committed → apply
- *   - Reads  → KvStore.get() (local memory, no Raft round trip)
- *   - Watch  → WatchManager (observes KvStore apply events)
- *   - Lease  → StateMachineDriver.propose(LEASE_GRANT/REVOKE) for persistence
  */
 @GrpcService
 public class CoordinatorGrpcService extends CoordinatorGrpc.CoordinatorImplBase {
@@ -32,6 +28,8 @@ public class CoordinatorGrpcService extends CoordinatorGrpc.CoordinatorImplBase 
     @Inject KvStore            kvStore;
     @Inject WatchManager       watchManager;
     @Inject LeaseManager       leaseManager;
+    @Inject TxnManager         txnManager;
+    @Inject CompactManager     compactManager;
 
     // ── KV ────────────────────────────────────────────────────────────────────
 
@@ -76,7 +74,46 @@ public class CoordinatorGrpcService extends CoordinatorGrpc.CoordinatorImplBase 
         }
     }
 
-    // ── Watch (bidirectional streaming) ───────────────────────────────────────
+    // ── Txn ───────────────────────────────────────────────────────────────────
+
+    @Override
+    public void txn(TxnRequest req, StreamObserver<TxnResponse> resp) {
+        try {
+            TxnManager.TxnRequest txnReq = buildTxnRequest(req);
+            TxnManager.TxnResponse txnResp = txnManager.execute(txnReq);
+
+            TxnResponse.Builder builder = TxnResponse.newBuilder()
+                .setSucceeded(txnResp.succeeded());
+            for (Long rev : txnResp.revisions()) {
+                builder.addResponses(OperationResponse.newBuilder()
+                    .setRevision(rev));
+            }
+            resp.onNext(builder.build());
+            resp.onCompleted();
+        } catch (Exception e) {
+            LOG.errorf(e, "Txn failed");
+            resp.onError(io.grpc.Status.INTERNAL.withCause(e).asRuntimeException());
+        }
+    }
+
+    // ── Compact ───────────────────────────────────────────────────────────────
+
+    @Override
+    public void compact(CompactRequest req, StreamObserver<CompactResponse> resp) {
+        try {
+            CompactManager.CompactResponse compactResp = compactManager.compact(req.getRevision());
+            resp.onNext(CompactResponse.newBuilder()
+                .setRevision(compactResp.compactedRevision())
+                .setRemovedCount(compactResp.removedVersions())
+                .build());
+            resp.onCompleted();
+        } catch (Exception e) {
+            LOG.errorf(e, "Compact failed");
+            resp.onError(io.grpc.Status.INTERNAL.withCause(e).asRuntimeException());
+        }
+    }
+
+    // ── Watch ─────────────────────────────────────────────────────────────────
 
     @Override
     public StreamObserver<WatchRequest> watch(StreamObserver<WatchResponse> downstream) {
@@ -122,7 +159,6 @@ public class CoordinatorGrpcService extends CoordinatorGrpc.CoordinatorImplBase 
     @Override
     public void leaseGrant(LeaseGrantRequest req, StreamObserver<LeaseGrantResponse> resp) {
         try {
-            // Persist through Raft
             driver.propose(StateMachineDriver.OP_LEASE_GRANT, req)
                     .get(10, TimeUnit.SECONDS);
             resp.onNext(LeaseGrantResponse.newBuilder()
@@ -137,14 +173,12 @@ public class CoordinatorGrpcService extends CoordinatorGrpc.CoordinatorImplBase 
     @Override
     public void leaseRevoke(LeaseRevokeRequest req, StreamObserver<LeaseRevokeResponse> resp) {
         try {
-            // Delete attached keys first
             for (String key : leaseManager.keysOf(req.getId())) {
                 driver.propose(StateMachineDriver.OP_DELETE,
                         DeleteRequest.newBuilder()
                                 .setKey(ByteString.copyFromUtf8(key))
                                 .build());
             }
-            // Then revoke the lease
             driver.propose(StateMachineDriver.OP_LEASE_REVOKE, req)
                     .get(10, TimeUnit.SECONDS);
             resp.onNext(LeaseRevokeResponse.getDefaultInstance());
@@ -180,5 +214,56 @@ public class CoordinatorGrpcService extends CoordinatorGrpc.CoordinatorImplBase 
     public void memberList(MemberListRequest req, StreamObserver<MemberListResponse> resp) {
         resp.onNext(MemberListResponse.getDefaultInstance());
         resp.onCompleted();
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private TxnManager.TxnRequest buildTxnRequest(TxnRequest req) {
+        List<TxnManager.Compare> compares = new ArrayList<>();
+        for (var compare : req.getCompareList()) {
+            compares.add(new TxnManager.Compare(
+                TxnManager.CompareTarget.valueOf(compare.getTarget().name()),
+                TxnManager.CompareResult.valueOf(compare.getResult().name()),
+                compare.getKey().toStringUtf8(),
+                compare.getValue()
+            ));
+        }
+
+        List<TxnManager.Op> successOps = buildOps(req.getSuccessList());
+        List<TxnManager.Op> failureOps = buildOps(req.getFailureList());
+
+        return new TxnManager.TxnRequest(compares, successOps, failureOps);
+    }
+
+    private List<TxnManager.Op> buildOps(List<RequestOp> ops) {
+        List<TxnManager.Op> result = new ArrayList<>();
+        for (var op : ops) {
+            if (op.hasPut()) {
+                result.add(new TxnManager.Op(
+                    TxnManager.OpType.PUT,
+                    op.getPut().getKey().toStringUtf8(),
+                    op.getPut().getValue(),
+                    "",
+                    op.getPut().getLease()
+                ));
+            } else if (op.hasDelete()) {
+                result.add(new TxnManager.Op(
+                    TxnManager.OpType.DELETE,
+                    op.getDelete().getKey().toStringUtf8(),
+                    ByteString.EMPTY,
+                    op.getDelete().getRangeEnd().toStringUtf8(),
+                    0
+                ));
+            } else if (op.hasRange()) {
+                result.add(new TxnManager.Op(
+                    TxnManager.OpType.RANGE,
+                    op.getRange().getKey().toStringUtf8(),
+                    ByteString.EMPTY,
+                    op.getRange().getRangeEnd().toStringUtf8(),
+                    0
+                ));
+            }
+        }
+        return result;
     }
 }

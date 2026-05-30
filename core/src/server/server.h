@@ -59,6 +59,8 @@ public:
     void Shutdown();
 
 private:
+    static constexpr size_t kMaxCommittedQueueSize = 10000;
+
     raft::RaftNode* node_;
 
     mutable std::mutex            mu_;

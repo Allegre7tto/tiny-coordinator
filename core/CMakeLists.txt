@@ -27,7 +27,6 @@ file(MAKE_DIRECTORY ${PROTO_GEN_DIR})
 set(PROTO_FILES
     ${PROTO_DIR}/raft.proto
     ${PROTO_DIR}/log.proto
-    ${PROTO_DIR}/coordinator.proto
 )
 
 set(PROTO_SRCS "")
