@@ -63,7 +63,7 @@ message InstallSnapshotResp {
 }
 
 // ─── Service ─────────────────────────────────────────────────────────────────
-service RaftInternal {
+service Raft {
   rpc RequestVote     (RequestVoteReq)     returns (RequestVoteResp);
   rpc AppendEntries   (AppendEntriesReq)   returns (AppendEntriesResp);
   rpc InstallSnapshot (InstallSnapshotReq) returns (InstallSnapshotResp);

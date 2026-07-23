@@ -17,3 +17,6 @@ coordinator/target/
 
 # OS
 .DS_Store
+target/
+core/target/
+coordinator/target/

@@ -1,0 +1,13 @@
+[package]
+name = "jni"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+engine = { path = "../engine" }
+jni = "0.21"
+tokio = { version = "1", features = ["full"] }
+tonic = "0.12"

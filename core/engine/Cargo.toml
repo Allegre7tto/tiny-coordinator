@@ -1,0 +1,13 @@
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+proto = { path = "../proto" }
+crc32fast = "1"
+rand = "0.8"
+prost = "0.13"
+tonic = "0.12"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"

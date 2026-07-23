@@ -1,25 +1,25 @@
-.PHONY: all build build-cpp build-java test test-cpp test-java clean help
+.PHONY: all build build-rust build-java test test-rust test-java clean help
 
 # ─── Default ──────────────────────────────────────────────────────────────────
 all: build
 
 # ─── Build ────────────────────────────────────────────────────────────────────
-build: build-cpp build-java
+build: build-rust build-java
 
-build-cpp:
-	@echo "==> Building C++ engine..."
-	cd core && conan install . --build=missing -of=build -s compiler.cppstd=20 && cmake --preset conan-release && cmake --build build --config Release
+build-rust:
+	@echo "==> Building Rust engine..."
+	cd core && cargo build --release
 
 build-java:
 	@echo "==> Building Java coordinator..."
 	cd coordinator && mvn package -DskipTests -q
 
 # ─── Test ─────────────────────────────────────────────────────────────────────
-test: test-cpp test-java
+test: test-rust test-java
 
-test-cpp:
-	@echo "==> Running C++ tests..."
-	cd core/build && ctest --output-on-failure
+test-rust:
+	@echo "==> Running Rust tests..."
+	cd core && cargo test
 
 test-java:
 	@echo "==> Running Java tests..."
@@ -27,16 +27,17 @@ test-java:
 
 # ─── Clean ────────────────────────────────────────────────────────────────────
 clean:
-	rm -rf core/build
+	cd core && cargo clean
 	cd coordinator && mvn clean -q
+	rm -rf core-cpp/build
 
 # ─── Help ─────────────────────────────────────────────────────────────────────
 help:
 	@echo "Targets:"
-	@echo "  build          Build C++ engine + Java coordinator"
-	@echo "  build-cpp      Build C++ engine only"
+	@echo "  build          Build Rust engine + Java coordinator"
+	@echo "  build-rust     Build Rust engine only"
 	@echo "  build-java     Build Java coordinator only"
 	@echo "  test           Run all tests"
-	@echo "  test-cpp       Run C++ unit tests"
-	@echo "  test-java      Run Java unit tests"
+	@echo "  test-rust      Run Rust tests"
+	@echo "  test-java      Run Java tests"
 	@echo "  clean          Clean all build artifacts"

@@ -7,32 +7,18 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
-import engine.client.RaftLogClient;
-
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
-/**
- * TTL-based lease manager.
- *
- * Architecture (v3 — Raft-persistent):
- *   Grant / Revoke are submitted as Raft log entries via StateMachineDriver.
- *   The actual state mutation happens in applyGrant / applyRevoke,
- *   called during the committed-entry apply loop (single-threaded, deterministic).
- *
- *   KeepAlive is leader-local (not replicated) — same as etcd.
- *   Expiry check runs via @Scheduled; expired leases trigger a Revoke proposal.
- */
 @ApplicationScoped
 public class LeaseManager {
 
     private static final Logger LOG = Logger.getLogger(LeaseManager.class);
 
     @Inject StateMachineDriver driver;
-    @Inject RaftLogClient raftClient;
 
     private record Lease(
         long       id,
@@ -45,8 +31,6 @@ public class LeaseManager {
 
     private final Map<Long, Lease> leases = new ConcurrentHashMap<>();
 
-    // ── Apply (called by StateMachineDriver, deterministic, single-threaded) ──
-
     public void applyGrant(long id, long ttlSeconds) {
         Instant deadline = Instant.now().plusSeconds(ttlSeconds);
         leases.put(id, new Lease(id, ttlSeconds, deadline, ConcurrentHashMap.newKeySet()));
@@ -57,11 +41,8 @@ public class LeaseManager {
         Lease lease = leases.remove(id);
         if (lease != null) {
             LOG.debugf("Lease applied: revoke id=%d (%d keys)", id, lease.keys().size());
-            // Key deletion is triggered by CoordinatorGrpcService when it calls leaseRevoke
         }
     }
-
-    // ── KeepAlive (leader-local, not replicated) ──────────────────────────────
 
     public long keepAlive(long id) {
         Lease lease = leases.get(id);
@@ -70,8 +51,6 @@ public class LeaseManager {
         leases.put(id, lease.withDeadline(newDeadline));
         return lease.ttlSeconds();
     }
-
-    // ── Key attachment ────────────────────────────────────────────────────────
 
     public void attach(long id, String key) {
         Lease lease = leases.get(id);
@@ -96,28 +75,16 @@ public class LeaseManager {
 
     public boolean exists(long id) { return leases.containsKey(id); }
 
-    // ── Expiry check (every 1 second) ─────────────────────────────────────────
-
     @Scheduled(every = "1s")
     void checkExpiry() {
-        // Only leader should propose lease revocations
-        try {
-            if (!raftClient.status().getIsLeader()) return;
-        } catch (Exception e) {
-            LOG.debug("Failed to check leader status: " + e.getMessage());
-            return;
-        }
-
         Instant now = Instant.now();
         leases.forEach((id, lease) -> {
             if (now.isAfter(lease.deadline())) {
                 LOG.infof("Lease expired id=%d, proposing revoke for %d keys", id, lease.keys().size());
-                // Propose revoke through Raft so all nodes see the deletion
                 try {
                     driver.propose(StateMachineDriver.OP_LEASE_REVOKE,
                             LeaseRevokeRequest.newBuilder().setId(id).build());
 
-                    // Also delete all attached keys
                     for (String key : lease.keys()) {
                         driver.propose(StateMachineDriver.OP_DELETE,
                                 DeleteRequest.newBuilder()
@@ -130,7 +97,4 @@ public class LeaseManager {
             }
         });
     }
-
-    // ── Snapshot / Restore (for StateMachineDriver) ───────────────────────────
-    // TODO: serialize lease state into KvStore snapshot for crash recovery
 }

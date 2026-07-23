@@ -1,37 +1,24 @@
 package engine.coordinator;
 
-import engine.client.RaftLogClient;
+import engine.client.RaftLib;
 import engine.coordinator.v1.CoordinatorOuterClass.*;
-import engine.log.v1.Log.CommittedEntry;
-import engine.log.v1.Log.SnapshotChunk;
 import engine.mvcc.CompactManager;
 import engine.mvcc.TxnManager;
 
-import com.google.protobuf.ByteString;
 import com.google.protobuf.InvalidProtocolBufferException;
-import io.smallrye.mutiny.infrastructure.Infrastructure;
-import io.smallrye.mutiny.subscription.Cancellable;
-import io.vertx.mutiny.core.Vertx;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
+import java.nio.ByteBuffer;
 import java.util.Map;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
-/**
- * Drives the state machine apply loop:
- *
- *   1. On startup: LoadSnapshot → restore KvStore + LeaseManager
- *   2. SubscribeCommitted(lastApplied+1) → apply each entry in order
- *   3. Periodically SaveSnapshot → C++ truncates Raft log
- *
- * All writes go through {@link #propose}: serialize → RaftLogClient.propose() →
- * wait for the entry to be applied via the committed stream.
- */
 @ApplicationScoped
 public class StateMachineDriver {
 
@@ -44,82 +31,102 @@ public class StateMachineDriver {
     public static final byte OP_TXN          = 0x05;
     public static final byte OP_COMPACT      = 0x06;
 
-    private static final long SNAPSHOT_INTERVAL = 10_000; // entries between snapshots
+    private static final long SNAPSHOT_INTERVAL = 10_000;
+    private static final int MAX_ENTRY_SIZE = 4 * 1024 * 1024;
+    private static final int MAX_SNAP_SIZE  = 256 * 1024 * 1024;
 
-    @Inject RaftLogClient   raftClient;
     @Inject KvStore         kvStore;
     @Inject LeaseManager    leaseManager;
     @Inject TxnManager      txnManager;
     @Inject CompactManager  compactManager;
 
+    @ConfigProperty(name = "raft.id")        long   raftId;
+    @ConfigProperty(name = "raft.data.dir")  String dataDir;
+    @ConfigProperty(name = "raft.peers")     String peers;
+    @ConfigProperty(name = "raft.port")      int    raftPort;
+
+    private RaftLib raftLib;
     private final AtomicLong lastApplied = new AtomicLong(0);
     private long lastSnapshotIndex = 0;
-
-    // Pending proposals: log_index → CompletableFuture
+    private final AtomicBoolean running = new AtomicBoolean(true);
     private final Map<Long, CompletableFuture<Long>> pendingProposals = new ConcurrentHashMap<>();
-
-    private Cancellable subscription;
 
     @PostConstruct
     void start() {
-        // Phase 1: Load snapshot from C++
-        try {
-            raftClient.loadSnapshot()
-                    .collect().asList()
-                    .await().atMost(java.time.Duration.ofSeconds(30))
-                    .forEach(chunk -> {
-                        if (chunk.getData().size() > 0) {
-                            kvStore.restore(chunk.getData().toByteArray());
-                            lastApplied.set(chunk.getLastIndex());
-                            lastSnapshotIndex = chunk.getLastIndex();
-                            LOG.infof("Loaded snapshot at index=%d", chunk.getLastIndex());
-                        }
-                    });
-        } catch (Exception e) {
-            LOG.info("No existing snapshot, starting fresh");
-        }
+        String[] peerAddrs = peers.split(",\\s*");
+        raftLib = new RaftLib(raftId, dataDir, peerAddrs, raftPort);
 
-        // Phase 2: Subscribe to committed entries
+        loadSnapshot();
+
         long startIdx = lastApplied.get() + 1;
-        LOG.infof("Subscribing to committed entries from index=%d", startIdx);
-        subscribeCommitted(startIdx);
+        LOG.infof("Starting apply loop from index=%d", startIdx);
+        Thread recvThread = new Thread(this::recvLoop, "raft-recv");
+        recvThread.setDaemon(true);
+        recvThread.start();
     }
 
     @PreDestroy
     void stop() {
-        if (subscription != null) subscription.cancel();
+        running.set(false);
+        raftLib.close();
     }
 
-    // ── Propose (called by CoordinatorGrpcService) ────────────────────────────
+    // ── Propose ────────────────────────────────────────────────────────────────
 
-    /**
-     * Serialize operation and submit through Raft.
-     * Returns a future that completes with the revision when the entry is applied.
-     */
     public CompletableFuture<Long> propose(byte opType, com.google.protobuf.Message msg) {
         byte[] payload = msg.toByteArray();
         byte[] data = new byte[1 + payload.length];
         data[0] = opType;
         System.arraycopy(payload, 0, data, 1, payload.length);
 
-        return raftClient.propose(data)
-                .thenCompose(resp -> {
-                    CompletableFuture<Long> future = new CompletableFuture<>();
-                    pendingProposals.put(resp.getIndex(), future);
+        ByteBuffer buf = ByteBuffer.allocateDirect(data.length);
+        buf.put(data);
 
-                    // Timeout to prevent indefinite blocking
-                    future.orTimeout(10, TimeUnit.SECONDS)
-                          .whenComplete((rev, ex) -> pendingProposals.remove(resp.getIndex()));
-                    return future;
-                });
+        long encoded = raftLib.propose(buf);
+        long statusCode = encoded >> 48;
+        long index = encoded & 0x0000_FFFF_FFFF_FFFFL;
+
+        CompletableFuture<Long> future = new CompletableFuture<>();
+        if (statusCode != 0) {
+            future.completeExceptionally(new RuntimeException("propose failed: status=" + statusCode));
+            return future;
+        }
+
+        pendingProposals.put(index, future);
+        future.orTimeout(10, TimeUnit.SECONDS)
+              .whenComplete((rev, ex) -> pendingProposals.remove(index));
+        return future;
     }
 
-    // ── Apply (single-threaded, called from committed stream) ─────────────────
+    // ── Recv loop ──────────────────────────────────────────────────────────────
 
-    private void applyEntry(CommittedEntry entry) {
-        long index = entry.getIndex();
-        byte[] data = entry.getData().toByteArray();
+    private void recvLoop() {
+        ByteBuffer buf = ByteBuffer.allocateDirect(MAX_ENTRY_SIZE);
+        while (running.get()) {
+            try {
+                int n = raftLib.recv(buf);
+                if (n < 0) {
+                    if (running.get()) {
+                        LOG.warnf("recv returned %d, restarting loop", n);
+                        try { Thread.sleep(1000); } catch (InterruptedException e) { break; }
+                    }
+                    continue;
+                }
+                long index = buf.getLong(0);
+                long term = buf.getLong(8);
+                byte[] data = new byte[n - 16];
+                buf.position(16);
+                buf.get(data);
+                applyEntry(index, term, data);
+            } catch (Exception e) {
+                LOG.errorf(e, "Error in recv loop");
+            }
+        }
+    }
 
+    // ── Apply ──────────────────────────────────────────────────────────────────
+
+    private void applyEntry(long index, long term, byte[] data) {
         if (data.length == 0) {
             lastApplied.set(index);
             return;
@@ -148,12 +155,8 @@ public class StateMachineDriver {
                     LeaseRevokeRequest req = LeaseRevokeRequest.parseFrom(payload);
                     leaseManager.applyRevoke(req.getId());
                 }
-                case OP_TXN -> {
-                    LOG.debugf("Txn applied at index=%d", index);
-                }
-                case OP_COMPACT -> {
-                    LOG.debugf("Compact applied at index=%d", index);
-                }
+                case OP_TXN -> LOG.debugf("Txn applied at index=%d", index);
+                case OP_COMPACT -> LOG.debugf("Compact applied at index=%d", index);
                 default -> LOG.warnf("Unknown op type: 0x%02x at index %d", opType, index);
             }
         } catch (InvalidProtocolBufferException e) {
@@ -162,21 +165,23 @@ public class StateMachineDriver {
 
         lastApplied.set(index);
 
-        // Complete pending proposal future
         CompletableFuture<Long> pending = pendingProposals.remove(index);
         if (pending != null) pending.complete(kvStore.revision());
 
-        // Periodic snapshot
         if (index - lastSnapshotIndex >= SNAPSHOT_INTERVAL) {
-            triggerSnapshot(index);
+            saveSnapshot(index);
         }
     }
 
-    private void triggerSnapshot(long index) {
+    // ── Snapshot ───────────────────────────────────────────────────────────────
+
+    private void saveSnapshot(long index) {
         CompletableFuture.runAsync(() -> {
             try {
                 byte[] snapData = kvStore.snapshot();
-                raftClient.saveSnapshot(index, 0, snapData).get(30, TimeUnit.SECONDS);
+                ByteBuffer buf = ByteBuffer.allocateDirect(snapData.length);
+                buf.put(snapData);
+                raftLib.snap(index, buf);
                 lastSnapshotIndex = index;
                 LOG.infof("Snapshot saved at index=%d size=%d", index, snapData.length);
             } catch (Exception e) {
@@ -185,28 +190,22 @@ public class StateMachineDriver {
         });
     }
 
+    private void loadSnapshot() {
+        ByteBuffer buf = ByteBuffer.allocateDirect(MAX_SNAP_SIZE);
+        int size = raftLib.load(buf);
+        if (size <= 0) {
+            LOG.info("No existing snapshot, starting fresh");
+            return;
+        }
+        byte[] data = new byte[size];
+        buf.position(0);
+        buf.get(data);
+        kvStore.restore(data);
+        long rev = kvStore.revision();
+        lastApplied.set(rev);
+        lastSnapshotIndex = rev;
+        LOG.infof("Loaded snapshot size=%d revision=%d", size, rev);
+    }
+
     public long lastAppliedIndex() { return lastApplied.get(); }
-
-    private void subscribeCommitted(long startIdx) {
-        subscription = raftClient.subscribeCommitted(startIdx)
-                .onFailure().retry().withBackOff(java.time.Duration.ofSeconds(1), java.time.Duration.ofSeconds(10)).atMost(3)
-                .emitOn(Infrastructure.getDefaultExecutor())
-                .subscribe().with(
-                    this::applyEntry,
-                    err -> {
-                        LOG.errorf(err, "Committed stream error; will attempt reconnect");
-                        scheduleReconnect();
-                    }
-                );
-    }
-
-    private void scheduleReconnect() {
-        long delay = 1000; // 1 second initial delay
-        Vertx vertx = Vertx.vertx();
-        vertx.setTimer(delay, id -> {
-            long newStartIdx = lastApplied.get() + 1;
-            LOG.infof("Reconnecting to committed stream from index=%d", newStartIdx);
-            subscribeCommitted(newStartIdx);
-        });
-    }
 }
