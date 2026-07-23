@@ -1,60 +1,68 @@
 services:
-  # ── C++ Raft nodes (3-node cluster) ──────────────────────────────────────────
-  engine-cpp-0:
-    build:
-      context: .
-      dockerfile: Dockerfile.cpp
-    command: ["0", "/data", "engine-cpp-0:7000", "engine-cpp-1:7000", "engine-cpp-2:7000"]
-    volumes:
-      - cpp-data-0:/data
-    networks:
-      - engine-net
-
-  engine-cpp-1:
-    build:
-      context: .
-      dockerfile: Dockerfile.cpp
-    command: ["1", "/data", "engine-cpp-0:7000", "engine-cpp-1:7000", "engine-cpp-2:7000"]
-    volumes:
-      - cpp-data-1:/data
-    networks:
-      - engine-net
-
-  engine-cpp-2:
-    build:
-      context: .
-      dockerfile: Dockerfile.cpp
-    command: ["2", "/data", "engine-cpp-0:7000", "engine-cpp-1:7000", "engine-cpp-2:7000"]
-    volumes:
-      - cpp-data-2:/data
-    networks:
-      - engine-net
-
-  # ── Java Coordinator (connects to node 0, follows leader automatically) ──────
-  coordinator:
+  coordinator-0:
     build:
       context: .
       dockerfile: Dockerfile.java
     environment:
-      ENGINE_CPP_HOST: engine-cpp-0
-      ENGINE_CPP_PORT: "7000"
+      RAFT_ID: "0"
+      RAFT_DATA_DIR: /data
+      RAFT_PEERS: coordinator-0:7000,coordinator-1:7000,coordinator-2:7000
+      RAFT_PORT: "7000"
       ENGINE_GRPC_PORT: "9000"
       ENGINE_MGMT_PORT: "9001"
       ENGINE_JSON_LOG: "true"
     ports:
-      - "9000:9000"   # gRPC API (coordinator.proto)
-      - "9001:9001"   # Health + Metrics (/q/health, /q/metrics)
-    depends_on:
-      - engine-cpp-0
-      - engine-cpp-1
-      - engine-cpp-2
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - data-0:/data
+    networks:
+      - engine-net
+
+  coordinator-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.java
+    environment:
+      RAFT_ID: "1"
+      RAFT_DATA_DIR: /data
+      RAFT_PEERS: coordinator-0:7000,coordinator-1:7000,coordinator-2:7000
+      RAFT_PORT: "7000"
+      ENGINE_GRPC_PORT: "9000"
+      ENGINE_MGMT_PORT: "9001"
+      ENGINE_JSON_LOG: "true"
+    ports:
+      - "9002:9000"
+      - "9003:9001"
+    volumes:
+      - data-1:/data
+    networks:
+      - engine-net
+
+  coordinator-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.java
+    environment:
+      RAFT_ID: "2"
+      RAFT_DATA_DIR: /data
+      RAFT_PEERS: coordinator-0:7000,coordinator-1:7000,coordinator-2:7000
+      RAFT_PORT: "7000"
+      ENGINE_GRPC_PORT: "9000"
+      ENGINE_MGMT_PORT: "9001"
+      ENGINE_JSON_LOG: "true"
+    ports:
+      - "9004:9000"
+      - "9005:9001"
+    volumes:
+      - data-2:/data
     networks:
       - engine-net
 
 volumes:
-  cpp-data-0:
-  cpp-data-1:
-  cpp-data-2:
+  data-0:
+  data-1:
+  data-2:
 
 networks:
   engine-net:
