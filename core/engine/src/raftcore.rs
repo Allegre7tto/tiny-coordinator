@@ -40,7 +40,7 @@ pub struct RaftCore {
     oncommit: Box<dyn Fn(ApplyMsg) + Send>,
 
     role: Role,
-    term: u64,
+    pub term: u64,
     voted: Option<u32>,
     granted: Vec<bool>,
     deadline: Instant,
@@ -49,11 +49,12 @@ pub struct RaftCore {
     log: Vec<LogEntry>,
     base: u64,
     anchor: u64,
-    commitidx: u64,
-    applyidx: u64,
+    pub commitidx: u64,
+    pub applyidx: u64,
     next: Vec<u64>,
     acked: Vec<u64>,
     snap: Vec<u8>,
+    pub leaderid: u64,
 }
 
 impl RaftCore {
@@ -89,6 +90,7 @@ impl RaftCore {
             next: vec![1; peercount as usize],
             acked: vec![0; peercount as usize],
             snap: Vec::new(),
+            leaderid: 0,
         };
 
         if let Some(hs) = raft.state.load() {
@@ -133,8 +135,8 @@ impl RaftCore {
                 let mut req = RequestVoteReq::default();
                 req.term = et;
                 req.candidate = self.me as u64;
-                req.last_index = li;
-                req.last_term = lt;
+                req.lastidx = li;
+                req.lastterm = lt;
                 tasks.push(RaftTask::Vote { peer, req, electionterm: et });
             }
         }
@@ -229,8 +231,8 @@ impl RaftCore {
         if args.term > self.term { self.stepdown(args.term); }
 
         let candidate = args.candidate as u32;
-        let fresh = args.last_term > self.lastterm()
-            || (args.last_term == self.lastterm() && args.last_index >= self.lastindex());
+        let fresh = args.lastterm > self.lastterm()
+            || (args.lastterm == self.lastterm() && args.lastidx >= self.lastindex());
         let canvote = fresh
             && (self.voted.is_none() || self.voted.unwrap() == candidate);
 
@@ -257,17 +259,18 @@ impl RaftCore {
             self.granted.fill(false);
         }
         self.deadline = Instant::now() + Self::randelectiontimeout();
+        self.leaderid = args.leaderid;
         resp.term = self.term;
 
-        let pi = args.prev_index;
-        let pt = args.prev_term;
+        let pi = args.previdx;
+        let pt = args.prevterm;
 
         if pi < self.base {
-            resp.conflict_index = self.base + 1;
+            resp.conflictidx = self.base + 1;
             return resp;
         }
         if pi > self.lastindex() {
-            resp.conflict_index = self.base + self.logsize();
+            resp.conflictidx = self.base + self.logsize();
             return resp;
         }
         if self.log[self.logoffset(pi)].term != pt {
@@ -276,8 +279,8 @@ impl RaftCore {
             while ci > self.base && self.log[self.logoffset(ci - 1)].term == ct {
                 ci -= 1;
             }
-            resp.conflict_term = ct;
-            resp.conflict_index = ci;
+            resp.conflictterm = ct;
+            resp.conflictidx = ci;
             return resp;
         }
 
@@ -299,8 +302,8 @@ impl RaftCore {
         }
         if changed { self.persist(); }
 
-        if args.leader_commit > self.commitidx {
-            self.commitidx = args.leader_commit.min(self.lastindex());
+        if args.leadercommit > self.commitidx {
+            self.commitidx = args.leadercommit.min(self.lastindex());
             self.applyready();
         }
         resp.success = true;
@@ -313,11 +316,11 @@ impl RaftCore {
         if args.term < self.term { return resp; }
         self.stepdown(args.term);
         self.deadline = Instant::now() + Self::randelectiontimeout();
-        if args.last_index > self.base {
+        if args.lastidx > self.base {
             let msg = ApplyMsg::Snapshot {
                 data: args.data.clone(),
-                term: args.last_term,
-                index: args.last_index,
+                term: args.lastterm,
+                index: args.lastidx,
             };
             (self.oncommit)(msg);
         }
@@ -357,14 +360,14 @@ impl RaftCore {
         }
 
         let next: u64;
-        if reply.conflict_term == 0 {
-            next = reply.conflict_index.max(1);
+        if reply.conflictterm == 0 {
+            next = reply.conflictidx.max(1);
         } else {
-            let pos = self.log.iter().rposition(|e| e.term == reply.conflict_term);
+            let pos = self.log.iter().rposition(|e| e.term == reply.conflictterm);
             if let Some(off) = pos {
                 next = self.base + off as u64 + 1;
             } else {
-                next = reply.conflict_index.max(1);
+                next = reply.conflictidx.max(1);
             }
         }
         self.next[peer as usize] = next.min(self.base + self.logsize());
@@ -420,6 +423,7 @@ impl RaftCore {
         }
         self.role = Role::Follower;
         self.granted.fill(false);
+        self.leaderid = 0;
         self.deadline = Instant::now() + Self::randelectiontimeout();
     }
 
@@ -491,10 +495,10 @@ impl RaftCore {
 
         let mut req = AppendEntriesReq::default();
         req.term = self.term;
-        req.leader_id = self.me as u64;
-        req.prev_index = prev;
-        req.prev_term = self.log[self.logoffset(prev)].term;
-        req.leader_commit = self.commitidx;
+        req.leaderid = self.me as u64;
+        req.previdx = prev;
+        req.prevterm = self.log[self.logoffset(prev)].term;
+        req.leadercommit = self.commitidx;
 
         let mut sentnum = 0u32;
         if nxt <= self.lastindex() {
@@ -511,9 +515,9 @@ impl RaftCore {
     fn buildsnapshottask(&self, peer: u32) -> RaftTask {
         let mut req = InstallSnapshotReq::default();
         req.term = self.term;
-        req.leader_id = self.me as u64;
-        req.last_index = self.base;
-        req.last_term = self.anchor;
+        req.leaderid = self.me as u64;
+        req.lastidx = self.base;
+        req.lastterm = self.anchor;
         req.data = self.snap.clone();
 
         RaftTask::InstallSnapshot { peer, req, sentterm: self.term, lastindex: self.base }

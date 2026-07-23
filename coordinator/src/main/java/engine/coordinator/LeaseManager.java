@@ -2,6 +2,7 @@ package engine.coordinator;
 
 import engine.coordinator.v1.CoordinatorOuterClass.*;
 
+import com.google.protobuf.ByteString;
 import io.quarkus.scheduler.Scheduled;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -9,9 +10,9 @@ import org.jboss.logging.Logger;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 @ApplicationScoped
 public class LeaseManager {
@@ -21,15 +22,18 @@ public class LeaseManager {
     @Inject StateMachineDriver driver;
 
     private record Lease(
-        long       id,
-        long       ttlSeconds,
-        Instant    deadline,
-        Set<String> keys
+        long              id,
+        long              ttlSeconds,
+        Instant           deadline,
+        Set<ByteString>   keys
     ) {
         Lease withDeadline(Instant d) { return new Lease(id, ttlSeconds, d, keys); }
     }
 
     private final Map<Long, Lease> leases = new ConcurrentHashMap<>();
+    private final AtomicLong nextLeaseId = new AtomicLong(1);
+
+    public long generateId() { return nextLeaseId.getAndIncrement(); }
 
     public void applyGrant(long id, long ttlSeconds) {
         Instant deadline = Instant.now().plusSeconds(ttlSeconds);
@@ -44,25 +48,24 @@ public class LeaseManager {
         }
     }
 
-    public long keepAlive(long id) {
+    public void renewOnApply(long id) {
         Lease lease = leases.get(id);
         if (lease == null) throw new IllegalArgumentException("lease not found: " + id);
         Instant newDeadline = Instant.now().plusSeconds(lease.ttlSeconds());
         leases.put(id, lease.withDeadline(newDeadline));
-        return lease.ttlSeconds();
     }
 
-    public void attach(long id, String key) {
+    public void attach(long id, ByteString key) {
         Lease lease = leases.get(id);
         if (lease != null) lease.keys().add(key);
     }
 
-    public void detach(long id, String key) {
+    public void detach(long id, ByteString key) {
         Lease lease = leases.get(id);
         if (lease != null) lease.keys().remove(key);
     }
 
-    public Set<String> keysOf(long id) {
+    public Set<ByteString> keysOf(long id) {
         Lease lease = leases.get(id);
         return (lease != null) ? Set.copyOf(lease.keys()) : Set.of();
     }
@@ -77,24 +80,34 @@ public class LeaseManager {
 
     @Scheduled(every = "1s")
     void checkExpiry() {
-        Instant now = Instant.now();
-        leases.forEach((id, lease) -> {
-            if (now.isAfter(lease.deadline())) {
-                LOG.infof("Lease expired id=%d, proposing revoke for %d keys", id, lease.keys().size());
-                try {
-                    driver.propose(StateMachineDriver.OP_LEASE_REVOKE,
-                            LeaseRevokeRequest.newBuilder().setId(id).build());
+        if (!driver.isLeader()) return;
 
-                    for (String key : lease.keys()) {
-                        driver.propose(StateMachineDriver.OP_DELETE,
-                                DeleteRequest.newBuilder()
-                                        .setKey(com.google.protobuf.ByteString.copyFromUtf8(key))
-                                        .build());
-                    }
-                } catch (Exception e) {
-                    LOG.warnf("Failed to propose lease revoke for id=%d: %s", id, e.getMessage());
-                }
-            }
+        Instant now = Instant.now();
+        List<Long> expiredIds = new ArrayList<>();
+        leases.forEach((id, lease) -> {
+            if (now.isAfter(lease.deadline())) expiredIds.add(id);
         });
+        for (long id : expiredIds) {
+            LOG.infof("Lease expired id=%d, proposing expire", id);
+            try {
+                driver.proposeLeaseExpire(id);
+            } catch (Exception e) {
+                LOG.warnf("Failed to propose lease expire id=%d: %s", id, e.getMessage());
+            }
+        }
+    }
+
+    public List<LeaseSnapshot> allLeases() {
+        List<LeaseSnapshot> result = new ArrayList<>();
+        leases.forEach((id, l) -> result.add(new LeaseSnapshot(id, l.ttlSeconds(), l.deadline(), Set.copyOf(l.keys()))));
+        return result;
+    }
+
+    public record LeaseSnapshot(long id, long ttlSeconds, Instant deadline, Set<ByteString> keys) {}
+
+    public void restoreLease(long id, long ttlSeconds, Instant deadline, Set<ByteString> keys) {
+        Lease lease = new Lease(id, ttlSeconds, deadline, ConcurrentHashMap.newKeySet());
+        lease.keys().addAll(keys);
+        leases.put(id, lease);
     }
 }

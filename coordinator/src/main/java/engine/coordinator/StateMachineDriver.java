@@ -2,9 +2,12 @@ package engine.coordinator;
 
 import engine.client.RaftLib;
 import engine.coordinator.v1.CoordinatorOuterClass.*;
+import engine.jni.v1.Jni.*;
 import engine.mvcc.CompactManager;
+import engine.mvcc.MvccStore;
 import engine.mvcc.TxnManager;
 
+import com.google.protobuf.ByteString;
 import com.google.protobuf.InvalidProtocolBufferException;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -13,7 +16,7 @@ import jakarta.inject.Inject;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
-import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.Map;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -30,11 +33,12 @@ public class StateMachineDriver {
     public static final byte OP_LEASE_REVOKE = 0x04;
     public static final byte OP_TXN          = 0x05;
     public static final byte OP_COMPACT      = 0x06;
+    public static final byte OP_LEASE_EXPIRE = 0x07;
+    public static final byte OP_LEASE_RENEW  = 0x08;
 
     private static final long SNAPSHOT_INTERVAL = 10_000;
-    private static final int MAX_ENTRY_SIZE = 4 * 1024 * 1024;
-    private static final int MAX_SNAP_SIZE  = 256 * 1024 * 1024;
 
+    @Inject MvccStore       mvccStore;
     @Inject KvStore         kvStore;
     @Inject LeaseManager    leaseManager;
     @Inject TxnManager      txnManager;
@@ -49,20 +53,17 @@ public class StateMachineDriver {
     private final AtomicLong lastApplied = new AtomicLong(0);
     private long lastSnapshotIndex = 0;
     private final AtomicBoolean running = new AtomicBoolean(true);
-    private final Map<Long, CompletableFuture<Long>> pendingProposals = new ConcurrentHashMap<>();
+    private final AtomicLong nextPid = new AtomicLong(1);
+    private final Map<Long, CompletableFuture<Long>> pending = new ConcurrentHashMap<>();
+    private final Map<Long, CompletableFuture<byte[]>> typedPending = new ConcurrentHashMap<>();
 
     @PostConstruct
     void start() {
         String[] peerAddrs = peers.split(",\\s*");
         raftLib = new RaftLib(raftId, dataDir, peerAddrs, raftPort);
-
         loadSnapshot();
-
-        long startIdx = lastApplied.get() + 1;
-        LOG.infof("Starting apply loop from index=%d", startIdx);
-        Thread recvThread = new Thread(this::recvLoop, "raft-recv");
-        recvThread.setDaemon(true);
-        recvThread.start();
+        LOG.infof("Starting apply loop from index=%d", lastApplied.get() + 1);
+        new Thread(this::recvLoop, "raft-recv").start();
     }
 
     @PreDestroy
@@ -71,141 +72,175 @@ public class StateMachineDriver {
         raftLib.close();
     }
 
-    // ── Propose ────────────────────────────────────────────────────────────────
+    public boolean isLeader()   { return raftLib.isLeader(); }
+    public long getTerm()       { return raftLib.getTerm(); }
+    public long getLeaderId()   { return raftLib.getLeaderId(); }
+    public long getCommitIdx()  { return raftLib.getCommitIndex(); }
+    public long getAppliedIdx() { return raftLib.getAppliedIndex(); }
+    public long lastApplied()   { return lastApplied.get(); }
 
-    public CompletableFuture<Long> propose(byte opType, com.google.protobuf.Message msg) {
-        byte[] payload = msg.toByteArray();
-        byte[] data = new byte[1 + payload.length];
-        data[0] = opType;
-        System.arraycopy(payload, 0, data, 1, payload.length);
-
-        ByteBuffer buf = ByteBuffer.allocateDirect(data.length);
-        buf.put(data);
-
-        long encoded = raftLib.propose(buf);
-        long statusCode = encoded >> 48;
-        long index = encoded & 0x0000_FFFF_FFFF_FFFFL;
-
-        CompletableFuture<Long> future = new CompletableFuture<>();
-        if (statusCode != 0) {
-            future.completeExceptionally(new RuntimeException("propose failed: status=" + statusCode));
-            return future;
-        }
-
-        pendingProposals.put(index, future);
-        future.orTimeout(10, TimeUnit.SECONDS)
-              .whenComplete((rev, ex) -> pendingProposals.remove(index));
-        return future;
+    public CompletableFuture<Long> propose(byte op, com.google.protobuf.Message msg) {
+        long pid = nextPid.getAndIncrement();
+        byte[] raw = envelope(op, pid, msg.toByteArray());
+        return doPropose(raw, pid);
     }
 
-    // ── Recv loop ──────────────────────────────────────────────────────────────
+    public CompletableFuture<byte[]> proposeTxn(TxnRequest req) {
+        long pid = nextPid.getAndIncrement();
+        byte[] raw = envelope(OP_TXN, pid, req.toByteArray());
+        return doProposeTyped(raw, pid);
+    }
+
+    public CompletableFuture<byte[]> proposeCompact(CompactRequest req) {
+        long pid = nextPid.getAndIncrement();
+        byte[] raw = envelope(OP_COMPACT, pid, req.toByteArray());
+        return doProposeTyped(raw, pid);
+    }
+
+    public void proposeLeaseExpire(long leaseId) {
+        long pid = nextPid.getAndIncrement();
+        byte[] pbytes = new byte[8];
+        java.nio.ByteBuffer.wrap(pbytes).order(ByteOrder.LITTLE_ENDIAN).putLong(leaseId);
+        byte[] raw = envelope(OP_LEASE_EXPIRE, pid, pbytes);
+        raftLib.propose(raw);
+    }
+
+    private static byte[] envelope(byte op, long pid, byte[] payload) {
+        return CommandEnvelope.newBuilder()
+            .setOptype(op & 0xFF).setPid(pid)
+            .setPayload(ByteString.copyFrom(payload))
+            .build().toByteArray();
+    }
+
+    private CompletableFuture<Long> doPropose(byte[] raw, long pid) {
+        long encoded = raftLib.propose(raw);
+        long st = encoded >> 48;
+        CompletableFuture<Long> f = new CompletableFuture<>();
+        if (st != 0) {
+            f.completeExceptionally(new RuntimeException("propose failed: " + st));
+            return f;
+        }
+        pending.put(pid, f);
+        f.orTimeout(10, TimeUnit.SECONDS).whenComplete((r, e) -> pending.remove(pid));
+        return f;
+    }
+
+    private CompletableFuture<byte[]> doProposeTyped(byte[] raw, long pid) {
+        long encoded = raftLib.propose(raw);
+        long st = encoded >> 48;
+        CompletableFuture<byte[]> f = new CompletableFuture<>();
+        if (st != 0) {
+            f.completeExceptionally(new RuntimeException("propose failed: " + st));
+            return f;
+        }
+        typedPending.put(pid, f);
+        f.orTimeout(10, TimeUnit.SECONDS).whenComplete((r, e) -> typedPending.remove(pid));
+        return f;
+    }
 
     private void recvLoop() {
-        ByteBuffer buf = ByteBuffer.allocateDirect(MAX_ENTRY_SIZE);
         while (running.get()) {
             try {
-                int n = raftLib.recv(buf);
-                if (n < 0) {
-                    if (running.get()) {
-                        LOG.warnf("recv returned %d, restarting loop", n);
-                        try { Thread.sleep(1000); } catch (InterruptedException e) { break; }
-                    }
+                CommittedEntry entry = raftLib.recv();
+                if (entry == null) {
+                    if (running.get()) Thread.sleep(1000);
                     continue;
                 }
-                long index = buf.getLong(0);
-                long term = buf.getLong(8);
-                byte[] data = new byte[n - 16];
-                buf.position(16);
-                buf.get(data);
-                applyEntry(index, term, data);
+                apply(entry.getIndex(), entry.getTerm(), entry.getData());
             } catch (Exception e) {
-                LOG.errorf(e, "Error in recv loop");
+                if (running.get()) LOG.errorf(e, "recv error");
             }
         }
     }
 
-    // ── Apply ──────────────────────────────────────────────────────────────────
-
-    private void applyEntry(long index, long term, byte[] data) {
-        if (data.length == 0) {
+    private void apply(long index, long term, ByteString raw) {
+        if (raw.isEmpty()) {
             lastApplied.set(index);
             return;
         }
 
-        byte opType = data[0];
-        byte[] payload = new byte[data.length - 1];
-        System.arraycopy(data, 1, payload, 0, payload.length);
+        CommandEnvelope env;
+        try {
+            env = CommandEnvelope.parseFrom(raw);
+        } catch (InvalidProtocolBufferException e) {
+            lastApplied.set(index);
+            return;
+        }
+
+        byte op = (byte) env.getOptype();
+        long pid = env.getPid();
+        byte[] payload = env.getPayload().toByteArray();
+
+        long rev = mvccStore.currentRevision() + 1;
+        mvccStore.setCurrentRevision(rev);
 
         try {
-            switch (opType) {
+            switch (op) {
                 case OP_PUT -> {
                     PutRequest req = PutRequest.parseFrom(payload);
-                    kvStore.applyPut(req);
-                    if (req.getLease() != 0) leaseManager.attach(req.getLease(), req.getKey().toStringUtf8());
+                    kvStore.applyPut(req, rev);
+                    if (req.getLease() != 0) leaseManager.attach(req.getLease(), req.getKey());
                 }
-                case OP_DELETE -> {
-                    DeleteRequest req = DeleteRequest.parseFrom(payload);
-                    kvStore.applyDelete(req);
-                }
+                case OP_DELETE -> kvStore.applyDelete(DeleteRequest.parseFrom(payload), rev);
                 case OP_LEASE_GRANT -> {
                     LeaseGrantRequest req = LeaseGrantRequest.parseFrom(payload);
                     leaseManager.applyGrant(req.getId(), req.getTtl());
                 }
-                case OP_LEASE_REVOKE -> {
-                    LeaseRevokeRequest req = LeaseRevokeRequest.parseFrom(payload);
-                    leaseManager.applyRevoke(req.getId());
+                case OP_LEASE_REVOKE ->
+                    leaseManager.applyRevoke(LeaseRevokeRequest.parseFrom(payload).getId());
+                case OP_LEASE_RENEW ->
+                    leaseManager.renewOnApply(LeaseKeepAliveRequest.parseFrom(payload).getId());
+                case OP_LEASE_EXPIRE -> {
+                    long leaseId = java.nio.ByteBuffer.wrap(payload, 0, 8).order(ByteOrder.LITTLE_ENDIAN).getLong();
+                    for (var key : leaseManager.keysOf(leaseId)) {
+                        mvccStore.deleteAtRevision(key, rev);
+                    }
+                    leaseManager.applyRevoke(leaseId);
                 }
-                case OP_TXN -> LOG.debugf("Txn applied at index=%d", index);
-                case OP_COMPACT -> LOG.debugf("Compact applied at index=%d", index);
-                default -> LOG.warnf("Unknown op type: 0x%02x at index %d", opType, index);
+                case OP_TXN -> {
+                    var f = typedPending.remove(pid);
+                    if (f != null) f.complete(txnManager.applyTxn(TxnRequest.parseFrom(payload)).toByteArray());
+                }
+                case OP_COMPACT -> {
+                    var f = typedPending.remove(pid);
+                    if (f != null) f.complete(compactManager.applyCompact(CompactRequest.parseFrom(payload)).toByteArray());
+                }
+                default -> LOG.warnf("Unknown op 0x%02x", op);
             }
         } catch (InvalidProtocolBufferException e) {
-            LOG.errorf(e, "Failed to parse entry at index %d", index);
+            LOG.errorf(e, "parse error at index %d", index);
         }
 
         lastApplied.set(index);
 
-        CompletableFuture<Long> pending = pendingProposals.remove(index);
-        if (pending != null) pending.complete(kvStore.revision());
+        var f = pending.remove(pid);
+        if (f != null) f.complete(mvccStore.currentRevision());
 
-        if (index - lastSnapshotIndex >= SNAPSHOT_INTERVAL) {
-            saveSnapshot(index);
-        }
+        if (index - lastSnapshotIndex >= SNAPSHOT_INTERVAL) saveSnapshot(index);
     }
 
-    // ── Snapshot ───────────────────────────────────────────────────────────────
-
     private void saveSnapshot(long index) {
-        CompletableFuture.runAsync(() -> {
-            try {
-                byte[] snapData = kvStore.snapshot();
-                ByteBuffer buf = ByteBuffer.allocateDirect(snapData.length);
-                buf.put(snapData);
-                raftLib.snap(index, buf);
-                lastSnapshotIndex = index;
-                LOG.infof("Snapshot saved at index=%d size=%d", index, snapData.length);
-            } catch (Exception e) {
-                LOG.errorf(e, "Snapshot save failed at index=%d", index);
-            }
-        });
+        try {
+            byte[] snap = kvStore.snapshot(lastApplied.get(), leaseManager);
+            raftLib.snap(index, snap);
+            lastSnapshotIndex = index;
+            LOG.infof("snapshot at index=%d size=%d", index, snap.length);
+        } catch (Exception e) {
+            LOG.errorf(e, "snapshot failed at index=%d", index);
+        }
     }
 
     private void loadSnapshot() {
-        ByteBuffer buf = ByteBuffer.allocateDirect(MAX_SNAP_SIZE);
-        int size = raftLib.load(buf);
-        if (size <= 0) {
-            LOG.info("No existing snapshot, starting fresh");
+        SnapshotLoad snap = raftLib.load();
+        if (!snap.getFound()) {
+            LOG.info("no snapshot, starting fresh");
             return;
         }
-        byte[] data = new byte[size];
-        buf.position(0);
-        buf.get(data);
-        kvStore.restore(data);
-        long rev = kvStore.revision();
-        lastApplied.set(rev);
-        lastSnapshotIndex = rev;
-        LOG.infof("Loaded snapshot size=%d revision=%d", size, rev);
+        kvStore.restore(snap.getData().toByteArray(), leaseManager);
+        lastApplied.set(snap.getLastidx());
+        lastSnapshotIndex = snap.getLastidx();
+        LOG.infof("loaded snapshot at index=%d size=%d", snap.getLastidx(), snap.getData().size());
     }
 
-    public long lastAppliedIndex() { return lastApplied.get(); }
+    public void setLastApplied(long idx) { lastApplied.set(idx); }
 }

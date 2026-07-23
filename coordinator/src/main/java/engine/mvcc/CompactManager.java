@@ -1,13 +1,12 @@
 package engine.mvcc;
 
+import engine.coordinator.v1.CoordinatorOuterClass.*;
+
 import io.quarkus.scheduler.Scheduled;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
-/**
- * Compact 管理器。支持手动和自动清理历史版本。
- */
 @ApplicationScoped
 public class CompactManager {
 
@@ -16,27 +15,22 @@ public class CompactManager {
 
     @Inject MvccStore mvccStore;
 
-    public record CompactResponse(long compactedRevision, int removedVersions) {}
-
-    /**
-     * 手动触发 compact
-     */
-    public CompactResponse compact(long revision) {
-        if (revision < mvccStore.compactRevision()) {
+    public CompactResponse applyCompact(CompactRequest req) {
+        long rev = req.getRevision();
+        if (rev <= mvccStore.compactRevision()) {
             throw new IllegalStateException(
-                "cannot compact revision " + revision +
-                ", already compacted to " + mvccStore.compactRevision());
+                "cannot compact: already at " + mvccStore.compactRevision());
         }
-        if (revision > mvccStore.currentRevision()) {
+        if (rev > mvccStore.currentRevision()) {
             throw new IllegalStateException(
-                "cannot compact revision " + revision +
-                ", current revision is " + mvccStore.currentRevision());
+                "cannot compact: beyond current revision " + mvccStore.currentRevision());
         }
-
-        LOG.infof("Compacting to revision %d", revision);
-        int removed = mvccStore.compact(revision);
-        LOG.infof("Compacted: removed %d old versions", removed);
-        return new CompactResponse(revision, removed);
+        int removed = mvccStore.compact(rev);
+        LOG.infof("Compacted to revision %d, removed %d versions", rev, removed);
+        return CompactResponse.newBuilder()
+            .setRevision(rev)
+            .setRemoved(removed)
+            .build();
     }
 
     @Scheduled(every = "1m")
@@ -45,10 +39,10 @@ public class CompactManager {
         long compactTo = current - MAX_REVISIONS_TO_KEEP;
         if (compactTo > mvccStore.compactRevision()) {
             LOG.debugf("Auto-compacting to revision %d", compactTo);
-            compact(compactTo);
+            mvccStore.compact(compactTo);
         }
     }
 
-    public long getCompactRevision() { return mvccStore.compactRevision(); }
+    public long getCompactrev() { return mvccStore.compactRevision(); }
     public long getCurrentRevision() { return mvccStore.currentRevision(); }
 }

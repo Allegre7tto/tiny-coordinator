@@ -1,5 +1,7 @@
 package engine.mvcc;
 
+import engine.coordinator.v1.CoordinatorOuterClass.*;
+
 import com.google.protobuf.ByteString;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -8,66 +10,53 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class CompactManagerTest {
 
-    private MvccStore mvccStore;
-    private CompactManager compactManager;
+    private MvccStore store;
+    private CompactManager mgr;
 
     @BeforeEach
     void setUp() {
-        mvccStore = new MvccStore();
-        compactManager = new CompactManager();
-        compactManager.mvccStore = mvccStore;
+        store = new MvccStore();
+        mgr = new CompactManager();
+        mgr.mvccStore = store;
     }
+
+    private long rev() {
+        long r = store.currentRevision() + 1;
+        store.setCurrentRevision(r);
+        return r;
+    }
+
+    private static ByteString bs(String s) { return ByteString.copyFromUtf8(s); }
 
     @Test
     void testCompact() {
-        mvccStore.put("key1", ByteString.copyFromUtf8("v1")); // rev 1
-        mvccStore.put("key1", ByteString.copyFromUtf8("v2")); // rev 2
-        mvccStore.put("key1", ByteString.copyFromUtf8("v3")); // rev 3
-        mvccStore.put("key2", ByteString.copyFromUtf8("v1")); // rev 4
+        store.putAtRevision(bs("k1"), bs("v1"), rev(), 0);
+        store.putAtRevision(bs("k1"), bs("v2"), rev(), 0);
+        store.putAtRevision(bs("k1"), bs("v3"), rev(), 0);
+        store.putAtRevision(bs("k2"), bs("v1"), rev(), 0);
 
-        // compact(3) removes revisions < 3: key1 rev 1,2 = 2 entries
-        CompactManager.CompactResponse response = compactManager.compact(3);
+        CompactResponse r = mgr.applyCompact(CompactRequest.newBuilder().setRevision(3).build());
+        assertEquals(3, r.getRevision());
+        assertEquals(2, r.getRemoved());
+        assertEquals(3, store.compactRevision());
 
-        assertEquals(3, response.compactedRevision());
-        assertEquals(2, response.removedVersions());
-
-        assertEquals(3, compactManager.getCompactRevision());
-
-        // key1 at rev 3 should still be accessible
-        var kv = mvccStore.get("key1", 3);
-        assertTrue(kv.isPresent());
-
-        // Querying below compact revision throws
-        assertThrows(IllegalStateException.class, () -> mvccStore.get("key1", 1));
+        assertTrue(store.get(bs("k1"), 3).isPresent());
     }
 
     @Test
-    void testCompactThrowsOnOldRevision() {
-        mvccStore.put("key1", ByteString.copyFromUtf8("v1"));
-        compactManager.compact(1);
-
-        assertThrows(IllegalStateException.class, () -> compactManager.compact(0));
+    void testCompactBeyondCurrent() {
+        store.putAtRevision(bs("k1"), bs("v1"), rev(), 0);
+        assertThrows(IllegalStateException.class, () ->
+            mgr.applyCompact(CompactRequest.newBuilder().setRevision(100).build()));
     }
 
     @Test
-    void testCompactThrowsOnFutureRevision() {
-        mvccStore.put("key1", ByteString.copyFromUtf8("v1"));
+    void testCompactBelowExisting() {
+        store.putAtRevision(bs("k1"), bs("v1"), rev(), 0);
+        store.putAtRevision(bs("k1"), bs("v2"), rev(), 0);
 
-        assertThrows(IllegalStateException.class, () -> compactManager.compact(100));
-    }
-
-    @Test
-    void testGetCurrentRevision() {
-        assertEquals(0, compactManager.getCurrentRevision());
-        mvccStore.put("key1", ByteString.copyFromUtf8("v1"));
-        assertEquals(1, compactManager.getCurrentRevision());
-    }
-
-    @Test
-    void testGetCompactRevision() {
-        assertEquals(0, compactManager.getCompactRevision());
-        mvccStore.put("key1", ByteString.copyFromUtf8("v1"));
-        compactManager.compact(1);
-        assertEquals(1, compactManager.getCompactRevision());
+        mgr.applyCompact(CompactRequest.newBuilder().setRevision(1).build());
+        assertThrows(IllegalStateException.class, () ->
+            mgr.applyCompact(CompactRequest.newBuilder().setRevision(1).build()));
     }
 }

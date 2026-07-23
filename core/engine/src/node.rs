@@ -29,10 +29,22 @@ pub struct SnapSaveReq {
 
 pub type SnapLoadReq = oneshot::Sender<Option<SnapshotData>>;
 
+#[derive(Debug, Clone, Copy)]
+pub struct NodeStatus {
+    pub isleader: bool,
+    pub term: u64,
+    pub commitidx: u64,
+    pub applyidx: u64,
+    pub leaderid: u64,
+}
+
+pub type StatusReq = oneshot::Sender<NodeStatus>;
+
 pub struct RaftNode {
     pub proposetx: mpsc::UnboundedSender<ProposeReq>,
     pub snapsavetx: mpsc::UnboundedSender<SnapSaveReq>,
     pub snaploadtx: mpsc::UnboundedSender<SnapLoadReq>,
+    pub statustx: mpsc::UnboundedSender<StatusReq>,
     pub isleader: Box<dyn Fn() -> bool + Send + Sync + 'static>,
     pub getterm: Box<dyn Fn() -> u64 + Send + Sync + 'static>,
 }
@@ -49,6 +61,7 @@ impl RaftNode {
         let (proposetx, mut proposerx) = mpsc::unbounded_channel::<ProposeReq>();
         let (snapsavetx, mut snapsaverx) = mpsc::unbounded_channel::<SnapSaveReq>();
         let (snaploadtx, mut snaploadrx) = mpsc::unbounded_channel::<SnapLoadReq>();
+        let (statustx, mut statusrx) = mpsc::unbounded_channel::<StatusReq>();
 
         tokio::spawn(async move {
             let (rpcreplytx, mut rpcreplyrx) = mpsc::unbounded_channel::<RaftTaskReply>();
@@ -144,6 +157,15 @@ impl RaftNode {
                         let data = raft.loadsnapshotdata();
                         respond.send(data).ok();
                     }
+                    Some(respond) = statusrx.recv() => {
+                        respond.send(NodeStatus {
+                            isleader: raft.isleader(),
+                            term: raft.term,
+                            commitidx: raft.commitidx,
+                            applyidx: raft.applyidx,
+                            leaderid: raft.leaderid,
+                        }).ok();
+                    }
                 }
             }
         });
@@ -152,6 +174,7 @@ impl RaftNode {
             proposetx,
             snapsavetx,
             snaploadtx,
+            statustx,
             isleader: Box::new(|| false),
             getterm: Box::new(|| 0),
         }

@@ -5,22 +5,22 @@ import jakarta.enterprise.context.ApplicationScoped;
 import org.jboss.logging.Logger;
 
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Consumer;
 
-/**
- * MVCC 存储引擎。
- *
- * 核心数据结构：
- * - store: ConcurrentHashMap<String, VersionedKeyValue>
- * - currentRevision: AtomicLong（复用 Raft applied index）
- * - compactRevision: volatile long（已 compact 的 revision）
- */
 @ApplicationScoped
 public class MvccStore {
+
+    public static final Comparator<ByteString> CMP = (a, b) -> {
+        int minLen = Math.min(a.size(), b.size());
+        for (int i = 0; i < minLen; i++) {
+            int cmp = (a.byteAt(i) & 0xFF) - (b.byteAt(i) & 0xFF);
+            if (cmp != 0) return cmp;
+        }
+        return a.size() - b.size();
+    };
 
     private static final Logger LOG = Logger.getLogger(MvccStore.class);
 
@@ -28,61 +28,57 @@ public class MvccStore {
 
     public record WatchEvent(
         EventType type,
-        String key,
+        ByteString key,
         long revision,
         VersionedKeyValue.KvEntry kv
     ) {}
 
-    private final ConcurrentHashMap<String, VersionedKeyValue> store = new ConcurrentHashMap<>();
+    private final TreeMap<ByteString, VersionedKeyValue> store = new TreeMap<>(CMP);
     private final AtomicLong currentRevision = new AtomicLong(0);
     private volatile long compactRevision = 0;
 
     private final CopyOnWriteArrayList<Consumer<WatchEvent>> watchers = new CopyOnWriteArrayList<>();
     private final ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
 
-    // ── Put ──────────────────────────────────────────────────────────────────
-
-    public long put(String key, ByteString value, long lease) {
+    public long putAtRevision(ByteString key, ByteString value, long revision, long lease) {
         rwLock.writeLock().lock();
         try {
-            long rev = currentRevision.incrementAndGet();
             VersionedKeyValue vkv = store.computeIfAbsent(key, VersionedKeyValue::new);
-            vkv.put(value, rev, lease);
-            notifyWatchers(EventType.PUT, key, rev, vkv.latest());
-            return rev;
+            vkv.put(value, revision, lease);
+            notifyWatchers(EventType.PUT, key, revision, vkv.latest());
+            return revision;
         } finally {
             rwLock.writeLock().unlock();
         }
     }
 
-    public long put(String key, ByteString value) {
-        return put(key, value, 0);
-    }
-
-    // ── Delete ───────────────────────────────────────────────────────────────
-
-    public long delete(String key) {
+    public long deleteAtRevision(ByteString key, long revision) {
         rwLock.writeLock().lock();
         try {
             VersionedKeyValue vkv = store.get(key);
             if (vkv == null || vkv.latest() == null) return -1;
-            long rev = currentRevision.incrementAndGet();
-            vkv.tombstone(rev);
-            notifyWatchers(EventType.DELETE, key, rev, vkv.latest());
-            return rev;
+            vkv.tombstone(revision);
+            notifyWatchers(EventType.DELETE, key, revision, vkv.latest());
+            return revision;
         } finally {
             rwLock.writeLock().unlock();
         }
     }
 
-    public int deleteRange(String startKey, String endKey) {
+    public int deleteRangeAtRevision(ByteString startKey, ByteString endKey, long revision) {
         rwLock.writeLock().lock();
         try {
             int count = 0;
-            for (String key : store.keySet()) {
-                if (key.compareTo(startKey) >= 0 &&
-                    (endKey.isEmpty() || key.compareTo(endKey) < 0)) {
-                    if (delete(key) > 0) count++;
+            var submap = endKey.isEmpty()
+                ? store.tailMap(startKey, true)
+                : store.subMap(startKey, true, endKey, false);
+            List<ByteString> keys = new ArrayList<>(submap.keySet());
+            for (ByteString key : keys) {
+                VersionedKeyValue vkv = store.get(key);
+                if (vkv != null && vkv.latest() != null) {
+                    vkv.tombstone(revision);
+                    notifyWatchers(EventType.DELETE, key, revision, vkv.latest());
+                    count++;
                 }
             }
             return count;
@@ -91,9 +87,7 @@ public class MvccStore {
         }
     }
 
-    // ── Get ──────────────────────────────────────────────────────────────────
-
-    public Optional<VersionedKeyValue.KvEntry> get(String key, long revision) {
+    public Optional<VersionedKeyValue.KvEntry> get(ByteString key, long revision) {
         rwLock.readLock().lock();
         try {
             if (revision > 0 && revision < compactRevision) {
@@ -110,16 +104,14 @@ public class MvccStore {
         }
     }
 
-    public Optional<VersionedKeyValue.KvEntry> get(String key) {
+    public Optional<VersionedKeyValue.KvEntry> get(ByteString key) {
         return get(key, 0);
     }
 
-    // ── Range ────────────────────────────────────────────────────────────────
-
-    public record RangeEntry(String key, VersionedKeyValue.KvEntry kv) {}
+    public record RangeEntry(ByteString key, VersionedKeyValue.KvEntry kv) {}
     public record RangeResult(List<RangeEntry> entries, long revision, boolean more) {}
 
-    public RangeResult range(String startKey, String endKey, long revision, long limit) {
+    public RangeResult range(ByteString startKey, ByteString endKey, long revision, long limit) {
         rwLock.readLock().lock();
         try {
             if (revision > 0 && revision < compactRevision) {
@@ -127,13 +119,15 @@ public class MvccStore {
             }
             long queryRevision = (revision > 0) ? revision : currentRevision.get();
             List<RangeEntry> entries = new ArrayList<>();
-            for (var e : store.entrySet()) {
-                String key = e.getKey();
-                if (key.compareTo(startKey) < 0) continue;
-                if (!endKey.isEmpty() && key.compareTo(endKey) >= 0) continue;
+
+            var submap = endKey.isEmpty()
+                ? store.tailMap(startKey, true)
+                : store.subMap(startKey, true, endKey, false);
+
+            for (var e : submap.entrySet()) {
                 VersionedKeyValue.KvEntry kv = e.getValue().getAtRevision(queryRevision);
                 if (kv != null) {
-                    entries.add(new RangeEntry(key, kv));
+                    entries.add(new RangeEntry(e.getKey(), kv));
                     if (limit > 0 && entries.size() >= limit) {
                         return new RangeResult(entries, queryRevision, true);
                     }
@@ -145,14 +139,12 @@ public class MvccStore {
         }
     }
 
-    // ── Watch history ────────────────────────────────────────────────────────
-
     public List<WatchEvent> getAllHistoryEvents(long fromRevision, long toRevision) {
         rwLock.readLock().lock();
         try {
             List<WatchEvent> events = new ArrayList<>();
             for (var vkvEntry : store.entrySet()) {
-                String key = vkvEntry.getKey();
+                ByteString key = vkvEntry.getKey();
                 var versions = vkvEntry.getValue().getVersionRange(fromRevision, toRevision);
                 for (var entry : versions.entrySet()) {
                     EventType type = entry.getValue().isTombstone() ? EventType.DELETE : EventType.PUT;
@@ -166,8 +158,6 @@ public class MvccStore {
         }
     }
 
-    // ── Watcher ──────────────────────────────────────────────────────────────
-
     public void addWatcher(Consumer<WatchEvent> watcher) {
         watchers.add(watcher);
     }
@@ -176,7 +166,7 @@ public class MvccStore {
         watchers.remove(watcher);
     }
 
-    private void notifyWatchers(EventType type, String key, long revision,
+    private void notifyWatchers(EventType type, ByteString key, long revision,
                                 VersionedKeyValue.KvEntry kv) {
         WatchEvent event = new WatchEvent(type, key, revision, kv);
         for (var watcher : watchers) {
@@ -185,8 +175,6 @@ public class MvccStore {
         }
     }
 
-    // ── Compact ──────────────────────────────────────────────────────────────
-
     public long compactRevision() { return compactRevision; }
 
     public long currentRevision() { return currentRevision.get(); }
@@ -194,6 +182,12 @@ public class MvccStore {
     public void setCurrentRevision(long revision) {
         rwLock.writeLock().lock();
         try { currentRevision.set(revision); }
+        finally { rwLock.writeLock().unlock(); }
+    }
+
+    public void setCompactrev(long rev) {
+        rwLock.writeLock().lock();
+        try { compactRevision = rev; }
         finally { rwLock.writeLock().unlock(); }
     }
 
@@ -210,8 +204,6 @@ public class MvccStore {
             rwLock.writeLock().unlock();
         }
     }
-
-    // ── Snapshot / Restore ───────────────────────────────────────────────────
 
     public List<RangeEntry> snapshotEntries() {
         rwLock.readLock().lock();

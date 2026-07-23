@@ -6,63 +6,62 @@ option cc_generic_services = false;
 
 // ─── Common ──────────────────────────────────────────────────────────────────
 message KeyValue {
-  bytes  key            = 1;
-  bytes  value          = 2;
-  int64  create_revision = 3;
-  int64  mod_revision   = 4;
-  int64  version        = 5;
-  int64  lease          = 6;
+  bytes key       = 1;
+  bytes value     = 2;
+  int64 createrev = 3;
+  int64 modrev    = 4;
+  int64 version   = 5;
+  int64 lease     = 6;
 }
 
 message ResponseHeader {
-  uint64 cluster_id = 1;
-  uint64 member_id  = 2;
-  int64  revision   = 3;  // store revision at the time of the response
-  uint64 raft_term  = 4;
+  uint64 clusterid = 1;
+  uint64 memberid  = 2;
+  int64  revision  = 3;
+  uint64 raftterm  = 4;
 }
 
 // ─── KV Operations ───────────────────────────────────────────────────────────
 message PutRequest {
-  bytes key    = 1;
-  bytes value  = 2;
-  int64 lease  = 3;
-  // client dedup
-  uint64 client_id  = 4;
-  uint64 request_id = 5;
+  bytes  key      = 1;
+  bytes  value    = 2;
+  int64  lease    = 3;
+  uint64 clientid = 4;
+  uint64 reqid    = 5;
 }
 
 message PutResponse {
-  ResponseHeader header   = 1;
-  KeyValue       prev_kv  = 2;  // populated if requested
+  ResponseHeader header  = 1;
+  KeyValue       prevkv  = 2;
 }
 
 message GetRequest {
-  bytes  key       = 1;
-  bytes  range_end = 2;  // empty = point lookup; "\0" = all keys >= key
-  int64  limit     = 3;
-  int64  revision  = 4;  // 0 = latest
-  bool   keys_only = 5;
+  bytes key      = 1;
+  bytes rangeend = 2;
+  int64 limit    = 3;
+  int64 revision = 4;
+  bool  keysonly = 5;
 }
 
 message GetResponse {
-  ResponseHeader   header  = 1;
-  repeated KeyValue kvs    = 2;
-  bool             more    = 3;
-  int64            count   = 4;
+  ResponseHeader   header = 1;
+  repeated KeyValue kvs   = 2;
+  bool             more   = 3;
+  int64            count  = 4;
 }
 
 message DeleteRequest {
-  bytes  key       = 1;
-  bytes  range_end = 2;
-  bool   prev_kv   = 3;
-  uint64 client_id  = 4;
-  uint64 request_id = 5;
+  bytes  key      = 1;
+  bytes  rangeend = 2;
+  bool   prevkv   = 3;
+  uint64 clientid = 4;
+  uint64 reqid    = 5;
 }
 
 message DeleteResponse {
   ResponseHeader    header   = 1;
   int64             deleted  = 2;
-  repeated KeyValue prev_kvs = 3;
+  repeated KeyValue prevkvs  = 3;
 }
 
 // ─── Watch ───────────────────────────────────────────────────────────────────
@@ -72,42 +71,42 @@ enum EventType {
 }
 
 message Event {
-  EventType type    = 1;
-  KeyValue  kv      = 2;
-  KeyValue  prev_kv = 3;
+  EventType type   = 1;
+  KeyValue  kv     = 2;
+  KeyValue  prevkv = 3;
 }
 
 message WatchCreateRequest {
-  bytes key              = 1;
-  bytes range_end        = 2;
-  int64 start_revision   = 3;
-  bool  prev_kv          = 4;
+  bytes key      = 1;
+  bytes rangeend = 2;
+  int64 startrev = 3;
+  bool  prevkv   = 4;
 }
 
 message WatchCancelRequest {
-  int64 watch_id = 1;
+  int64 watchid = 1;
 }
 
 message WatchRequest {
-  oneof request_union {
-    WatchCreateRequest create_request = 1;
-    WatchCancelRequest cancel_request = 2;
+  oneof requnion {
+    WatchCreateRequest createreq = 1;
+    WatchCancelRequest cancelreq = 2;
   }
 }
 
 message WatchResponse {
-  ResponseHeader   header    = 1;
-  int64            watch_id  = 2;
-  bool             created   = 3;
-  bool             canceled  = 4;
-  int64            compact_revision = 5;
-  repeated Event   events    = 6;
+  ResponseHeader   header      = 1;
+  int64            watchid     = 2;
+  bool             created     = 3;
+  bool             canceled    = 4;
+  int64            compactrev  = 5;
+  repeated Event   events      = 6;
 }
 
 // ─── Lease ───────────────────────────────────────────────────────────────────
 message LeaseGrantRequest {
-  int64  ttl = 1;
-  int64  id  = 2;  // 0 = server generates
+  int64 ttl = 1;
+  int64 id  = 2;
 }
 
 message LeaseGrantResponse {
@@ -136,7 +135,6 @@ message LeaseKeepAliveResponse {
 }
 
 // ─── Txn ─────────────────────────────────────────────────────────────────────
-
 message Compare {
   enum CompareTarget {
     KEY            = 0;
@@ -147,15 +145,15 @@ message Compare {
   }
 
   enum CompareResult {
-    EQUAL  = 0;
+    EQUAL   = 0;
     GREATER = 1;
-    LESS   = 2;
+    LESS    = 2;
   }
 
-  CompareTarget target  = 1;
-  CompareResult result  = 2;
-  bytes          key     = 3;
-  bytes          value   = 4;
+  CompareTarget target = 1;
+  CompareResult result = 2;
+  bytes         key    = 3;
+  bytes         value  = 4;
 }
 
 message RequestOp {
@@ -188,22 +186,21 @@ message TxnResponse {
 }
 
 // ─── Compact ────────────────────────────────────────────────────────────────
-
 message CompactRequest {
   int64 revision = 1;
 }
 
 message CompactResponse {
-  ResponseHeader header        = 1;
-  int64          revision      = 2;
-  int64          removed_count = 3;
+  ResponseHeader header    = 1;
+  int64          revision  = 2;
+  int64          removed   = 3;
 }
 
 // ─── Cluster ─────────────────────────────────────────────────────────────────
 message Member {
-  uint64          id         = 1;
-  string          name       = 2;
-  repeated string peer_urls  = 3;
+  uint64          id       = 1;
+  string          name     = 2;
+  repeated string peerurls = 3;
 }
 
 message MemberListRequest  {}
@@ -213,27 +210,38 @@ message MemberListResponse {
   repeated Member  members = 2;
 }
 
+// ─── Internal ────────────────────────────────────────────────────────────────
+message CommandEnvelope {
+  uint32 optype    = 1;
+  uint64 pid       = 2;
+  bytes  payload   = 3;
+}
+
+message LeaseState {
+  int64  id         = 1;
+  int64  ttlsecs    = 2;
+  int64  deadlinems = 3;
+  repeated bytes keys = 4;
+}
+
+message StateMachineSnapshot {
+  int64  lastappliedidx = 1;
+  int64  mvccrev        = 2;
+  int64  compactrev     = 3;
+  repeated KeyValue kvs = 4;
+  repeated LeaseState leases = 5;
+}
+
 // ─── Service ─────────────────────────────────────────────────────────────────
 service Coordinator {
-  // KV
   rpc Put    (PutRequest)    returns (PutResponse);
   rpc Get    (GetRequest)    returns (GetResponse);
   rpc Delete (DeleteRequest) returns (DeleteResponse);
-
-  // Txn
   rpc Txn (TxnRequest) returns (TxnResponse);
-
-  // Compact
   rpc Compact (CompactRequest) returns (CompactResponse);
-
-  // Watch (bidirectional streaming)
   rpc Watch (stream WatchRequest) returns (stream WatchResponse);
-
-  // Lease
   rpc LeaseGrant     (LeaseGrantRequest)                           returns (LeaseGrantResponse);
   rpc LeaseRevoke    (LeaseRevokeRequest)                          returns (LeaseRevokeResponse);
   rpc LeaseKeepAlive (stream LeaseKeepAliveRequest)                returns (stream LeaseKeepAliveResponse);
-
-  // Cluster
   rpc MemberList (MemberListRequest) returns (MemberListResponse);
 }

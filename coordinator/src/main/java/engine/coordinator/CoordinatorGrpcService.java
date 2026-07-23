@@ -6,6 +6,7 @@ import engine.mvcc.CompactManager;
 import engine.mvcc.TxnManager;
 
 import com.google.protobuf.ByteString;
+import io.grpc.StatusException;
 import io.grpc.stub.StreamObserver;
 import io.quarkus.grpc.GrpcService;
 import jakarta.inject.Inject;
@@ -13,12 +14,8 @@ import org.jboss.logging.Logger;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
-/**
- * Implements coordinator.proto for external clients.
- */
 @GrpcService
 public class CoordinatorGrpcService extends CoordinatorGrpc.CoordinatorImplBase {
 
@@ -31,19 +28,22 @@ public class CoordinatorGrpcService extends CoordinatorGrpc.CoordinatorImplBase 
     @Inject TxnManager         txnManager;
     @Inject CompactManager     compactManager;
 
-    // ── KV ────────────────────────────────────────────────────────────────────
-
     @Override
     public void put(PutRequest req, StreamObserver<PutResponse> resp) {
         try {
+            requireLeader();
             long revision = driver.propose(StateMachineDriver.OP_PUT, req)
                     .get(10, TimeUnit.SECONDS);
             resp.onNext(PutResponse.newBuilder()
-                    .setHeader(ResponseHeader.newBuilder().setRevision(revision))
+                    .setHeader(ResponseHeader.newBuilder()
+                        .setRevision(revision)
+                        .setRaftterm(driver.getTerm()))
                     .build());
             resp.onCompleted();
+        } catch (StatusException e) {
+            resp.onError(e);
         } catch (Exception e) {
-            LOG.errorf(e, "Put failed: key=%s", req.getKey().toStringUtf8());
+            LOG.errorf(e, "Put failed");
             resp.onError(io.grpc.Status.UNAVAILABLE.withCause(e).asRuntimeException());
         }
     }
@@ -62,58 +62,52 @@ public class CoordinatorGrpcService extends CoordinatorGrpc.CoordinatorImplBase 
     @Override
     public void delete(DeleteRequest req, StreamObserver<DeleteResponse> resp) {
         try {
+            requireLeader();
             long revision = driver.propose(StateMachineDriver.OP_DELETE, req)
                     .get(10, TimeUnit.SECONDS);
             resp.onNext(DeleteResponse.newBuilder()
-                    .setHeader(ResponseHeader.newBuilder().setRevision(revision))
+                    .setHeader(ResponseHeader.newBuilder()
+                        .setRevision(revision)
+                        .setRaftterm(driver.getTerm()))
                     .build());
             resp.onCompleted();
+        } catch (StatusException e) {
+            resp.onError(e);
         } catch (Exception e) {
             LOG.errorf(e, "Delete failed");
             resp.onError(io.grpc.Status.UNAVAILABLE.withCause(e).asRuntimeException());
         }
     }
 
-    // ── Txn ───────────────────────────────────────────────────────────────────
-
     @Override
     public void txn(TxnRequest req, StreamObserver<TxnResponse> resp) {
         try {
-            TxnManager.TxnRequest txnReq = buildTxnRequest(req);
-            TxnManager.TxnResponse txnResp = txnManager.execute(txnReq);
-
-            TxnResponse.Builder builder = TxnResponse.newBuilder()
-                .setSucceeded(txnResp.succeeded());
-            for (Long rev : txnResp.revisions()) {
-                builder.addResponses(OperationResponse.newBuilder()
-                    .setRevision(rev));
-            }
-            resp.onNext(builder.build());
+            requireLeader();
+            byte[] result = driver.proposeTxn(req).get(10, TimeUnit.SECONDS);
+            resp.onNext(TxnResponse.parseFrom(result));
             resp.onCompleted();
+        } catch (StatusException e) {
+            resp.onError(e);
         } catch (Exception e) {
             LOG.errorf(e, "Txn failed");
             resp.onError(io.grpc.Status.INTERNAL.withCause(e).asRuntimeException());
         }
     }
 
-    // ── Compact ───────────────────────────────────────────────────────────────
-
     @Override
     public void compact(CompactRequest req, StreamObserver<CompactResponse> resp) {
         try {
-            CompactManager.CompactResponse compactResp = compactManager.compact(req.getRevision());
-            resp.onNext(CompactResponse.newBuilder()
-                .setRevision(compactResp.compactedRevision())
-                .setRemovedCount(compactResp.removedVersions())
-                .build());
+            requireLeader();
+            byte[] result = driver.proposeCompact(req).get(10, TimeUnit.SECONDS);
+            resp.onNext(CompactResponse.parseFrom(result));
             resp.onCompleted();
+        } catch (StatusException e) {
+            resp.onError(e);
         } catch (Exception e) {
             LOG.errorf(e, "Compact failed");
             resp.onError(io.grpc.Status.INTERNAL.withCause(e).asRuntimeException());
         }
     }
-
-    // ── Watch ─────────────────────────────────────────────────────────────────
 
     @Override
     public StreamObserver<WatchRequest> watch(StreamObserver<WatchResponse> downstream) {
@@ -122,19 +116,18 @@ public class CoordinatorGrpcService extends CoordinatorGrpc.CoordinatorImplBase 
         return new StreamObserver<>() {
             @Override
             public void onNext(WatchRequest req) {
-                if (req.hasCreateRequest()) {
-                    WatchCreateRequest cr = req.getCreateRequest();
+                if (req.hasCreatereq()) {
+                    WatchCreateRequest cr = req.getCreatereq();
                     long id = watchManager.register(
-                            cr.getKey().toStringUtf8(),
-                            cr.getRangeEnd().toStringUtf8(),
-                            cr.getStartRevision(),
+                            cr.getKey(),
+                            cr.getRangeend(),
+                            cr.getStartrev(),
                             downstream::onNext);
                     activeWatches.add(id);
                     downstream.onNext(WatchResponse.newBuilder()
-                            .setWatchId(id).setCreated(true).build());
-
-                } else if (req.hasCancelRequest()) {
-                    long id = req.getCancelRequest().getWatchId();
+                            .setWatchid(id).setCreated(true).build());
+                } else if (req.hasCancelreq()) {
+                    long id = req.getCancelreq().getWatchid();
                     watchManager.cancel(id);
                     activeWatches.remove(id);
                 }
@@ -154,16 +147,23 @@ public class CoordinatorGrpcService extends CoordinatorGrpc.CoordinatorImplBase 
         };
     }
 
-    // ── Lease ─────────────────────────────────────────────────────────────────
-
     @Override
     public void leaseGrant(LeaseGrantRequest req, StreamObserver<LeaseGrantResponse> resp) {
         try {
+            requireLeader();
+            long leaseId = req.getId();
+            if (leaseId == 0) {
+                leaseId = leaseManager.generateId();
+                req = req.toBuilder().setId(leaseId).build();
+            }
             driver.propose(StateMachineDriver.OP_LEASE_GRANT, req)
                     .get(10, TimeUnit.SECONDS);
             resp.onNext(LeaseGrantResponse.newBuilder()
-                    .setId(req.getId()).setTtl(req.getTtl()).build());
+                    .setId(leaseId).setTtl(req.getTtl())
+                    .setHeader(header()).build());
             resp.onCompleted();
+        } catch (StatusException e) {
+            resp.onError(e);
         } catch (Exception e) {
             resp.onNext(LeaseGrantResponse.newBuilder().setError(e.getMessage()).build());
             resp.onCompleted();
@@ -173,16 +173,14 @@ public class CoordinatorGrpcService extends CoordinatorGrpc.CoordinatorImplBase 
     @Override
     public void leaseRevoke(LeaseRevokeRequest req, StreamObserver<LeaseRevokeResponse> resp) {
         try {
-            for (String key : leaseManager.keysOf(req.getId())) {
-                driver.propose(StateMachineDriver.OP_DELETE,
-                        DeleteRequest.newBuilder()
-                                .setKey(ByteString.copyFromUtf8(key))
-                                .build());
-            }
+            requireLeader();
             driver.propose(StateMachineDriver.OP_LEASE_REVOKE, req)
                     .get(10, TimeUnit.SECONDS);
-            resp.onNext(LeaseRevokeResponse.getDefaultInstance());
+            resp.onNext(LeaseRevokeResponse.newBuilder()
+                    .setHeader(header()).build());
             resp.onCompleted();
+        } catch (StatusException e) {
+            resp.onError(e);
         } catch (Exception e) {
             resp.onError(io.grpc.Status.NOT_FOUND.withDescription(e.getMessage()).asRuntimeException());
         }
@@ -195,9 +193,14 @@ public class CoordinatorGrpcService extends CoordinatorGrpc.CoordinatorImplBase 
             @Override
             public void onNext(LeaseKeepAliveRequest req) {
                 try {
-                    long ttl = leaseManager.keepAlive(req.getId());
+                    requireLeader();
+                    driver.propose(StateMachineDriver.OP_LEASE_RENEW, req)
+                            .get(10, TimeUnit.SECONDS);
+                    long ttl = leaseManager.remaining(req.getId());
                     resp.onNext(LeaseKeepAliveResponse.newBuilder()
                             .setId(req.getId()).setTtl(ttl).build());
+                } catch (StatusException e) {
+                    resp.onError(e);
                 } catch (Exception e) {
                     resp.onError(io.grpc.Status.NOT_FOUND
                             .withDescription(e.getMessage()).asRuntimeException());
@@ -208,62 +211,24 @@ public class CoordinatorGrpcService extends CoordinatorGrpc.CoordinatorImplBase 
         };
     }
 
-    // ── Cluster ───────────────────────────────────────────────────────────────
-
     @Override
     public void memberList(MemberListRequest req, StreamObserver<MemberListResponse> resp) {
         resp.onNext(MemberListResponse.getDefaultInstance());
         resp.onCompleted();
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
-    private TxnManager.TxnRequest buildTxnRequest(TxnRequest req) {
-        List<TxnManager.Compare> compares = new ArrayList<>();
-        for (var compare : req.getCompareList()) {
-            compares.add(new TxnManager.Compare(
-                TxnManager.CompareTarget.valueOf(compare.getTarget().name()),
-                TxnManager.CompareResult.valueOf(compare.getResult().name()),
-                compare.getKey().toStringUtf8(),
-                compare.getValue()
-            ));
+    private void requireLeader() throws StatusException {
+        if (!driver.isLeader()) {
+            throw io.grpc.Status.UNAVAILABLE
+                .withDescription("NOT_LEADER")
+                .asException();
         }
-
-        List<TxnManager.Op> successOps = buildOps(req.getSuccessList());
-        List<TxnManager.Op> failureOps = buildOps(req.getFailureList());
-
-        return new TxnManager.TxnRequest(compares, successOps, failureOps);
     }
 
-    private List<TxnManager.Op> buildOps(List<RequestOp> ops) {
-        List<TxnManager.Op> result = new ArrayList<>();
-        for (var op : ops) {
-            if (op.hasPut()) {
-                result.add(new TxnManager.Op(
-                    TxnManager.OpType.PUT,
-                    op.getPut().getKey().toStringUtf8(),
-                    op.getPut().getValue(),
-                    "",
-                    op.getPut().getLease()
-                ));
-            } else if (op.hasDelete()) {
-                result.add(new TxnManager.Op(
-                    TxnManager.OpType.DELETE,
-                    op.getDelete().getKey().toStringUtf8(),
-                    ByteString.EMPTY,
-                    op.getDelete().getRangeEnd().toStringUtf8(),
-                    0
-                ));
-            } else if (op.hasRange()) {
-                result.add(new TxnManager.Op(
-                    TxnManager.OpType.RANGE,
-                    op.getRange().getKey().toStringUtf8(),
-                    ByteString.EMPTY,
-                    op.getRange().getRangeEnd().toStringUtf8(),
-                    0
-                ));
-            }
-        }
-        return result;
+    private ResponseHeader header() {
+        return ResponseHeader.newBuilder()
+            .setRaftterm(driver.getTerm())
+            .build();
     }
+
 }

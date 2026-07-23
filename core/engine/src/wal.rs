@@ -115,9 +115,9 @@ impl SnapshotStorage {
 
         let proto = InstallSnapshotReq {
             term: 0,
-            leader_id: 0,
-            last_index: snap.lastindex,
-            last_term: snap.lastterm,
+            leaderid: 0,
+            lastidx: snap.lastindex,
+            lastterm: snap.lastterm,
             data: snap.data.clone(),
         };
         let payload = match proto.encode_to_vec() {
@@ -131,8 +131,8 @@ impl SnapshotStorage {
         let payload = readfile(&self.path)?;
         let proto = InstallSnapshotReq::decode(payload.as_slice()).ok()?;
         Some(SnapshotData {
-            lastindex: proto.last_index,
-            lastterm: proto.last_term,
+            lastindex: proto.lastidx,
+            lastterm: proto.lastterm,
             data: proto.data,
         })
     }

@@ -3,13 +3,12 @@ package engine.coordinator;
 import engine.coordinator.v1.CoordinatorOuterClass.*;
 import engine.mvcc.MvccStore;
 
+import com.google.protobuf.ByteString;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
-
-import com.google.protobuf.ByteString;
 
 import java.time.Instant;
 import java.util.Map;
@@ -17,9 +16,6 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
-/**
- * Watch 管理器。支持从指定 revision 开始监听事件。
- */
 @ApplicationScoped
 public class WatchManager {
 
@@ -35,8 +31,8 @@ public class WatchManager {
 
     record WatchEntry(
         long id,
-        String key,
-        String rangeEnd,
+        ByteString key,
+        ByteString rangeEnd,
         long startRevision,
         Consumer<WatchResponse> callback,
         Instant createdAt
@@ -53,9 +49,7 @@ public class WatchManager {
         scheduler.shutdown();
     }
 
-    // ── Registration ─────────────────────────────────────────────────────────
-
-    public long register(String key, String rangeEnd, long startRevision,
+    public long register(ByteString key, ByteString rangeEnd, long startRevision,
                          Consumer<WatchResponse> callback) {
         long id = nextId.getAndIncrement();
         watches.put(id, new WatchEntry(id, key, rangeEnd, startRevision, callback, Instant.now()));
@@ -64,8 +58,7 @@ public class WatchManager {
             replayHistory(id, key, rangeEnd, startRevision);
         }
 
-        LOG.debugf("Watch registered id=%d key=%s rangeEnd=%s startRevision=%d",
-            id, key, rangeEnd, startRevision);
+        LOG.debugf("Watch registered id=%d startRevision=%d", id, startRevision);
         return id;
     }
 
@@ -74,9 +67,7 @@ public class WatchManager {
         LOG.debugf("Watch cancelled id=%d", watchId);
     }
 
-    // ── History replay ───────────────────────────────────────────────────────
-
-    private void replayHistory(long watchId, String key, String rangeEnd, long startRevision) {
+    private void replayHistory(long watchId, ByteString key, ByteString rangeEnd, long startRevision) {
         WatchEntry entry = watches.get(watchId);
         if (entry == null) return;
 
@@ -87,7 +78,7 @@ public class WatchManager {
             if (!matches(entry, event.key())) continue;
 
             WatchResponse resp = WatchResponse.newBuilder()
-                .setWatchId(watchId)
+                .setWatchid(watchId)
                 .setHeader(ResponseHeader.newBuilder().setRevision(event.revision()))
                 .addEvents(Event.newBuilder()
                     .setType(event.type() == MvccStore.EventType.PUT ? engine.coordinator.v1.CoordinatorOuterClass.EventType.PUT : engine.coordinator.v1.CoordinatorOuterClass.EventType.DELETE)
@@ -99,15 +90,13 @@ public class WatchManager {
         }
     }
 
-    // ── Event handler ────────────────────────────────────────────────────────
-
     private void onEvent(KvStore.WatchEvent event) {
         watches.values().forEach(w -> {
             if (event.revision() < w.startRevision()) return;
             if (!matches(w, event.key())) return;
 
             WatchResponse resp = WatchResponse.newBuilder()
-                .setWatchId(w.id())
+                .setWatchid(w.id())
                 .setHeader(ResponseHeader.newBuilder().setRevision(event.revision()))
                 .addEvents(Event.newBuilder()
                     .setType(event.type() == MvccStore.EventType.PUT ? engine.coordinator.v1.CoordinatorOuterClass.EventType.PUT : engine.coordinator.v1.CoordinatorOuterClass.EventType.DELETE)
@@ -122,33 +111,29 @@ public class WatchManager {
         });
     }
 
-    private boolean matches(WatchEntry w, String key) {
+    private boolean matches(WatchEntry w, ByteString key) {
         if (w.rangeEnd() == null || w.rangeEnd().isEmpty()) return key.equals(w.key());
-        if ("\0".equals(w.rangeEnd())) return key.compareTo(w.key()) >= 0;
-        return key.compareTo(w.key()) >= 0 && key.compareTo(w.rangeEnd()) < 0;
+        return MvccStore.CMP.compare(key, w.key()) >= 0
+            && MvccStore.CMP.compare(key, w.rangeEnd()) < 0;
     }
-
-    // ── Cleanup ──────────────────────────────────────────────────────────────
 
     private void cleanupExpiredWatches() {
         Instant now = Instant.now();
         watches.entrySet().removeIf(entry -> {
             if (now.isAfter(entry.getValue().createdAt().plusSeconds(WATCH_TTL_SECONDS))) {
-                LOG.debugf("Watch expired id=%d key=%s", entry.getKey(), entry.getValue().key());
+                LOG.debugf("Watch expired id=%d", entry.getKey());
                 return true;
             }
             return false;
         });
     }
 
-    // ── Internal ─────────────────────────────────────────────────────────────
-
     private engine.coordinator.v1.CoordinatorOuterClass.KeyValue toProto(MvccStore.WatchEvent event) {
         return engine.coordinator.v1.CoordinatorOuterClass.KeyValue.newBuilder()
-            .setKey(ByteString.copyFromUtf8(event.key()))
+            .setKey(event.key())
             .setValue(event.kv() != null ? event.kv().value() : ByteString.EMPTY)
-            .setCreateRevision(event.kv() != null ? event.kv().createRevision() : 0)
-            .setModRevision(event.kv() != null ? event.kv().modRevision() : 0)
+            .setCreaterev(event.kv() != null ? event.kv().createRevision() : 0)
+            .setModrev(event.kv() != null ? event.kv().modRevision() : 0)
             .setVersion(event.kv() != null ? event.kv().version() : 0)
             .build();
     }

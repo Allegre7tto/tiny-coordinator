@@ -73,7 +73,7 @@ public class EngineClient implements AutoCloseable {
     public List<KeyValue> range(String key, String rangeEnd, int limit) {
         GetResponse r = retry(() -> stub.get(GetRequest.newBuilder()
                 .setKey(ByteString.copyFromUtf8(key))
-                .setRangeEnd(ByteString.copyFromUtf8(rangeEnd))
+                .setRangeend(ByteString.copyFromUtf8(rangeEnd))
                 .setLimit(limit)
                 .build()));
         return r.getKvsList();
@@ -110,9 +110,9 @@ public class EngineClient implements AutoCloseable {
                 });
 
         requestObserver.onNext(WatchRequest.newBuilder()
-                .setCreateRequest(WatchCreateRequest.newBuilder()
+                .setCreatereq(WatchCreateRequest.newBuilder()
                         .setKey(ByteString.copyFromUtf8(key))
-                        .setRangeEnd(ByteString.copyFromUtf8(rangeEnd)))
+                        .setRangeend(ByteString.copyFromUtf8(rangeEnd)))
                 .build());
     }
 

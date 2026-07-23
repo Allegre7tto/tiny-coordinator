@@ -14,9 +14,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Consumer;
 
-/**
- * KV 存储服务层。委托给 MvccStore 实现 MVCC 语义。
- */
 @ApplicationScoped
 public class KvStore {
 
@@ -24,9 +21,7 @@ public class KvStore {
 
     @Inject MvccStore mvccStore;
 
-    // ── Watch events ─────────────────────────────────────────────────────────
-
-    public record WatchEvent(MvccStore.EventType type, String key, KeyValue kv, long revision) {}
+    public record WatchEvent(MvccStore.EventType type, ByteString key, KeyValue kv, long revision) {}
 
     private final List<Consumer<WatchEvent>> listeners = new ArrayList<>();
 
@@ -48,31 +43,19 @@ public class KvStore {
         }
     }
 
-    // ── Apply (called by StateMachineDriver, single-threaded) ────────────────
-
-    public void applyPut(PutRequest req) {
-        mvccStore.put(
-            req.getKey().toStringUtf8(),
-            req.getValue(),
-            req.getLease()
-        );
+    public void applyPut(PutRequest req, long revision) {
+        mvccStore.putAtRevision(req.getKey(), req.getValue(), revision, req.getLease());
     }
 
-    public void applyDelete(DeleteRequest req) {
-        String key = req.getKey().toStringUtf8();
-        String rangeEnd = req.getRangeEnd().toStringUtf8();
-        if (rangeEnd.isEmpty()) {
-            mvccStore.delete(key);
+    public void applyDelete(DeleteRequest req, long revision) {
+        if (req.getRangeend().isEmpty()) {
+            mvccStore.deleteAtRevision(req.getKey(), revision);
         } else {
-            mvccStore.deleteRange(key, rangeEnd);
+            mvccStore.deleteRangeAtRevision(req.getKey(), req.getRangeend(), revision);
         }
     }
 
-    // ── Read ─────────────────────────────────────────────────────────────────
-
     public GetResponse get(GetRequest req) {
-        String key = req.getKey().toStringUtf8();
-        String rangeEnd = req.getRangeEnd().toStringUtf8();
         long revision = req.getRevision();
         long limit = req.getLimit();
 
@@ -82,14 +65,14 @@ public class KvStore {
 
         GetResponse.Builder resp = GetResponse.newBuilder().setHeader(header);
 
-        if (rangeEnd.isEmpty()) {
-            var kvOpt = mvccStore.get(key, revision);
+        if (req.getRangeend().isEmpty()) {
+            var kvOpt = mvccStore.get(req.getKey(), revision);
             if (kvOpt.isPresent()) {
-                resp.addKvs(toProto(key, kvOpt.get()));
+                resp.addKvs(toProto(req.getKey(), kvOpt.get()));
                 resp.setCount(1);
             }
         } else {
-            var result = mvccStore.range(key, rangeEnd, revision, limit);
+            var result = mvccStore.range(req.getKey(), req.getRangeend(), revision, limit);
             for (var entry : result.entries()) {
                 resp.addKvs(toProto(entry.key(), entry.kv()));
             }
@@ -99,52 +82,69 @@ public class KvStore {
         return resp.build();
     }
 
-    // ── Snapshot / Restore ───────────────────────────────────────────────────
-
-    public byte[] snapshot() {
-        ResponseHeader header = ResponseHeader.newBuilder()
-            .setRevision(mvccStore.currentRevision())
-            .build();
-        GetResponse.Builder snap = GetResponse.newBuilder().setHeader(header);
+    public byte[] snapshot(long lastAppliedIndex, LeaseManager leaseManager) {
+        StateMachineSnapshot.Builder snap = StateMachineSnapshot.newBuilder()
+            .setLastappliedidx(lastAppliedIndex)
+            .setMvccrev(mvccStore.currentRevision())
+            .setCompactrev(mvccStore.compactRevision());
         for (var entry : mvccStore.snapshotEntries()) {
             snap.addKvs(toProto(entry.key(), entry.kv()));
+        }
+        for (var ls : leaseManager.allLeases()) {
+            LeaseState.Builder lb = LeaseState.newBuilder()
+                .setId(ls.id()).setTtlsecs(ls.ttlSeconds())
+                .setDeadlinems(ls.deadline().toEpochMilli());
+            for (var key : ls.keys()) lb.addKeys(key);
+            snap.addLeases(lb.build());
         }
         return snap.build().toByteArray();
     }
 
-    public void restore(byte[] data) {
+    public long restore(byte[] data, LeaseManager leaseManager) {
         try {
-            GetResponse snap = GetResponse.parseFrom(data);
+            StateMachineSnapshot snap = StateMachineSnapshot.parseFrom(data);
             List<MvccStore.RangeEntry> entries = new ArrayList<>();
             for (KeyValue kv : snap.getKvsList()) {
                 entries.add(new MvccStore.RangeEntry(
-                    kv.getKey().toStringUtf8(),
+                    kv.getKey(),
                     new VersionedKeyValue.KvEntry(
                         kv.getValue(),
-                        kv.getCreateRevision(),
-                        kv.getModRevision(),
+                        kv.getCreaterev(),
+                        kv.getModrev(),
                         kv.getVersion(),
                         kv.getLease()
                     )
                 ));
             }
-            mvccStore.restoreFromEntries(entries, snap.getHeader().getRevision());
-            LOG.infof("KvStore restored: revision=%d keys=%d", mvccStore.currentRevision(), entries.size());
+            mvccStore.restoreFromEntries(entries, snap.getMvccrev());
+            mvccStore.setCompactrev(snap.getCompactrev());
+
+            for (LeaseState ls : snap.getLeasesList()) {
+                leaseManager.restoreLease(
+                    ls.getId(), ls.getTtlsecs(),
+                    java.time.Instant.ofEpochMilli(ls.getDeadlinems()),
+                    new java.util.HashSet<>(ls.getKeysList()));
+            }
+
+            LOG.infof("restored: revision=%d compact=%d keys=%d leases=%d lastApplied=%d",
+                mvccStore.currentRevision(), mvccStore.compactRevision(),
+                entries.size(), snap.getLeasesCount(), snap.getLastappliedidx());
+
+            return snap.getLastappliedidx();
         } catch (Exception e) {
             LOG.errorf(e, "Failed to restore KvStore snapshot");
+            return 0;
         }
     }
 
     public long revision() { return mvccStore.currentRevision(); }
 
-    // ── Internal ─────────────────────────────────────────────────────────────
-
-    private KeyValue toProto(String key, VersionedKeyValue.KvEntry mv) {
+    private KeyValue toProto(ByteString key, VersionedKeyValue.KvEntry mv) {
         return KeyValue.newBuilder()
-            .setKey(ByteString.copyFromUtf8(key))
+            .setKey(key)
             .setValue(mv.value())
-            .setCreateRevision(mv.createRevision())
-            .setModRevision(mv.modRevision())
+            .setCreaterev(mv.createRevision())
+            .setModrev(mv.modRevision())
             .setVersion(mv.version())
             .setLease(mv.lease())
             .build();

@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package engine.jni.v1;
+
+message ProposeRequest {
+  bytes data = 1;
+}
+
+message ProposeResponse {
+  uint32 status = 1;
+  uint64 index  = 2;
+  uint64 term   = 3;
+}
+
+message CommittedEntry {
+  uint64 index = 1;
+  uint64 term  = 2;
+  bytes  data  = 3;
+}
+
+message SnapshotSave {
+  uint64 index = 1;
+  bytes  data  = 2;
+}
+
+message SnapshotLoad {
+  bool   found   = 1;
+  uint64 lastidx = 2;
+  uint64 lastterm = 3;
+  bytes  data    = 4;
+}
+
+message NodeStatus {
+  bool   isleader  = 1;
+  uint64 term      = 2;
+  uint64 commitidx = 3;
+  uint64 applyidx  = 4;
+  uint64 leaderid  = 5;
+}

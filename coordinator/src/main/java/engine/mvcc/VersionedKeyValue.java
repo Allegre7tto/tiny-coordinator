@@ -11,7 +11,7 @@ import java.util.TreeMap;
  */
 public class VersionedKeyValue {
 
-    private final String key;
+    private final ByteString key;
     private final TreeMap<Long, KvEntry> versions;
 
     public record KvEntry(
@@ -26,12 +26,12 @@ public class VersionedKeyValue {
         }
     }
 
-    public VersionedKeyValue(String key) {
+    public VersionedKeyValue(ByteString key) {
         this.key = key;
         this.versions = new TreeMap<>();
     }
 
-    public String key() { return key; }
+    public ByteString key() { return key; }
 
     /**
      * 添加新版本

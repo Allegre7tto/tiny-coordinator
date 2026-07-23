@@ -450,6 +450,8 @@ version = "0.1.0"
 dependencies = [
  "engine",
  "jni 0.21.1",
+ "prost",
+ "proto",
  "tokio",
  "tonic",
 ]

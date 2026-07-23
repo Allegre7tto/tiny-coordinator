@@ -12,7 +12,7 @@ class VersionedKeyValueTest {
 
     @BeforeEach
     void setUp() {
-        vkv = new VersionedKeyValue("testKey");
+        vkv = new VersionedKeyValue(ByteString.copyFromUtf8("testKey"));
     }
 
     @Test
