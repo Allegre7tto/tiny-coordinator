@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>dev.talent</groupId>
+    <artifactId>tiny-coordinator</artifactId>
+    <version>1.0-SNAPSHOT</version>
+  </parent>
+  <artifactId>runtime</artifactId>
+
+  <dependencies>
+    <dependency>
+      <groupId>dev.talent</groupId>
+      <artifactId>raft</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>dev.talent</groupId>
+      <artifactId>proto</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.grpc</groupId>
+      <artifactId>grpc-netty-shaded</artifactId>
+      <version>${grpc.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+</project>
